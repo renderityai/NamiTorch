@@ -7,6 +7,8 @@ import weakref
 from dataclasses import dataclass
 from numbers import Real
 
+from typing import Any as Array
+
 import numpy as np
 
 from .backends import array_device, ensure_same_device, get_backend, is_array, namespace, readonly, same_device, transfer, writable
@@ -30,6 +32,7 @@ from .autograd import (
     SELECTION_BACKWARD_RULES,
     BackwardNode,
     Context,
+    accumulate_gradient,
     arithmetic_node,
     elementwise_node,
     identity_backward,
@@ -42,6 +45,7 @@ from .autograd import (
     selection_node,
     transform_node,
     transfer_backward,
+    validate_accumulation,
 )
 from .dtype import (
     DType,
@@ -105,10 +109,10 @@ class _ReductionContext:
     source_version: int
 
 
-_storage_versions: dict[int, tuple[dict[int, weakref.ReferenceType[np.ndarray]], _VersionCounter]] = {}
+_storage_versions: dict[int, tuple[dict[int, weakref.ReferenceType[Array]], _VersionCounter]] = {}
 
 
-def _storage_owner(array: np.ndarray) -> object:
+def _storage_owner(array: Array) -> object:
     owner = array
     while True:
         base = owner.obj if isinstance(owner, memoryview) else getattr(owner, "base", None)
@@ -117,11 +121,11 @@ def _storage_owner(array: np.ndarray) -> object:
         owner = base
 
 
-def _shares_storage(left: np.ndarray, right: np.ndarray) -> bool:
+def _shares_storage(left: Array, right: Array) -> bool:
     return array_device(left) == array_device(right) and (_storage_owner(left) is _storage_owner(right) or namespace(left).shares_memory(left, right))
 
 
-def _storage_version(array: np.ndarray, preferred: _VersionCounter | None = None) -> _VersionCounter:
+def _storage_version(array: Array, preferred: _VersionCounter | None = None) -> _VersionCounter:
     owner = _storage_owner(array)
     identity = id(owner)
     existing = _storage_versions.get(identity)
@@ -133,7 +137,7 @@ def _storage_version(array: np.ndarray, preferred: _VersionCounter | None = None
     if array_identity in references:
         return counter
 
-    def discard(reference: weakref.ReferenceType[np.ndarray]) -> None:
+    def discard(reference: weakref.ReferenceType[Array]) -> None:
         entry = _storage_versions.get(identity)
         if entry is not None and entry[0].get(array_identity) is reference:
             del entry[0][array_identity]
@@ -189,7 +193,7 @@ def _index_sequence(sequence: list | tuple, active: set[int]) -> list:
     return result
 
 
-def _index_array(array: np.ndarray) -> np.ndarray:
+def _index_array(array: Array) -> Array:
     if array.dtype.kind not in "iub":
         raise TypeError(f"Index arrays must have integer or boolean dtype, got {array.dtype}.")
     if array.dtype.kind in "iu" and array.size:
@@ -236,7 +240,7 @@ def _normalize_index(index: object, device: Device) -> tuple[object, ...]:
     return tuple(_normalize_index_component(component, device) for component in components)
 
 
-def _scalar_index_view(array: np.ndarray, index: tuple[object, ...]) -> np.ndarray:
+def _scalar_index_view(array: Array, index: tuple[object, ...]) -> Array:
     integers = (component for component in index if component is not Ellipsis)
     slices = tuple(slice(integer % length, integer % length + 1) for integer, length in zip(integers, array.shape))
     return array[slices].reshape(()) if slices else array.view()
@@ -330,7 +334,7 @@ class Tensor:
 
     def _initialize(
         self,
-        array: np.ndarray,
+        array: Array,
         requires_grad: builtins.bool,
         version_counter: _VersionCounter | None = None,
     ) -> None:
@@ -356,7 +360,7 @@ class Tensor:
     @classmethod
     def _from_array(
         cls,
-        array: np.ndarray,
+        array: Array,
         requires_grad: builtins.bool,
         version_counter: _VersionCounter | None = None,
     ) -> Tensor:
@@ -430,12 +434,12 @@ class Tensor:
         run_backward(self, seed, retain_graph)
 
     @same_device
-    def _accumulate_grad(self, gradient: np.ndarray) -> None:
-        xp = namespace(self)
+    def _accumulate_grad(self, gradient: Array) -> None:
+        validate_accumulation(self, gradient)
+        accumulated = accumulate_gradient(self, gradient, None if self._grad is None else self._grad._data)
         if self._grad is None:
-            self._grad = Tensor._from_array(xp.array(gradient, dtype=self.dtype.numpy_dtype, copy=True), False)
+            self._grad = Tensor._from_array(accumulated, False)
         else:
-            accumulated = xp.add(self._grad._data, gradient)
             self._grad.copy_(accumulated)
 
     @property
@@ -459,7 +463,8 @@ class Tensor:
     def item(self) -> builtins.bool | builtins.int | builtins.float:
         if self.size != 1:
             raise ValueError(f"item() requires exactly one element, got {self.size}.")
-        return self._data.item()
+        with self._backend.context():
+            return self._data.item()
 
     def tolist(self) -> list | builtins.bool | builtins.int | builtins.float:
         return self.numpy().tolist()
@@ -482,26 +487,52 @@ class Tensor:
         result._writable = self._writable
         return result
 
-    def to(self, device=None, dtype=None, *, copy=False) -> Tensor:
+    def to(self, *args, device=None, dtype=None, copy=False, non_blocking=False) -> Tensor:
         if type(copy) is not builtins.bool:
             raise TypeError("copy must be a Python bool.")
+        if type(non_blocking) is not builtins.bool:
+            raise TypeError("non_blocking must be a Python bool.")
+        if len(args) > 2:
+            raise TypeError("to() accepts at most a device and a dtype as positional arguments.")
+        if args:
+            first = args[0]
+            dtype_argument = isinstance(first, DType) or isinstance(first, np.dtype) or isinstance(first, type) or (isinstance(first, str) and first in {value.value for value in DType})
+            if dtype_argument:
+                if len(args) != 1 or dtype is not None:
+                    raise TypeError("to() dtype must be specified only once.")
+                dtype = first
+            else:
+                if device is not None:
+                    raise TypeError("to() device must be specified only once.")
+                device = first
+                if len(args) == 2:
+                    if dtype is not None:
+                        raise TypeError("to() dtype must be specified only once.")
+                    dtype = args[1]
         target_device = self.device if device is None else Device(device)
         target_dtype = self.dtype if dtype is None else normalize_dtype(dtype)
         if target_device == self.device and target_dtype is self.dtype and not copy:
             return self if is_grad_enabled() or not self.requires_grad else self.detach()
-        array = transfer(self._data, target_device, target_dtype.numpy_dtype, copy=True)
+        array = transfer(self._data, target_device, target_dtype.numpy_dtype, copy=True, non_blocking=non_blocking)
         tracked = self.requires_grad and target_dtype.can_require_grad and is_grad_enabled()
         result = Tensor._from_array(array, tracked)
         if tracked:
             result._is_leaf = False
-            result._grad_fn = BackwardNode("to", (self,), transfer_backward, Context(device=self.device, dtype=self.dtype.numpy_dtype))
+            result._grad_fn = BackwardNode("to", (self,), transfer_backward, Context(device=self.device, dtype=self.dtype.numpy_dtype), device_transfer=True)
         return result
 
     def cpu(self) -> Tensor:
         return self.to("cpu")
 
-    def cuda(self, index=0) -> Tensor:
-        return self.to(Device("cuda", index))
+    def cuda(self, device=None, non_blocking=False, *, index=None) -> Tensor:
+        if index is not None:
+            if device is not None:
+                raise TypeError("cuda() device index must be specified only once.")
+            device = index
+        target = Device(device) if isinstance(device, (Device, str)) else Device("cuda", device)
+        if target.type != "cuda":
+            raise ValueError("cuda() requires a CUDA device.")
+        return self.to(device=target, non_blocking=non_blocking)
 
     def astype(self, dtype: object) -> Tensor:
         target = normalize_dtype(dtype)
@@ -539,7 +570,7 @@ class Tensor:
 
     def _operation_result(
         self,
-        array: np.ndarray,
+        array: Array,
         operation: str,
         operands: tuple[Tensor, ...],
         compute_dtype: DType,
@@ -933,7 +964,7 @@ class Tensor:
 
     @same_device
     def _transform_result(
-        self, array: np.ndarray, operation: str,
+        self, array: Array, operation: str,
         permutation: tuple[builtins.int, ...] | None = None,
         *, axes: tuple[builtins.int, ...] = (),
         **metadata,
@@ -1121,14 +1152,14 @@ class Tensor:
             return self
         return self._transform_result(self._data.copy(order="C"), "contiguous")
 
-    def _indexed_data(self, index: tuple[object, ...]) -> np.ndarray | np.generic:
+    def _indexed_data(self, index: tuple[object, ...]) -> Array | np.generic:
         self._backend.validate_index(self._data, index)
         try:
             return self._data[index]
         except IndexError as error:
             raise IndexError(f"Invalid index for Tensor with shape {self.shape}: {error}") from None
 
-    def _axis_index(self, dim: object, index: Tensor) -> tuple[np.ndarray, ...]:
+    def _axis_index(self, dim: object, index: Tensor) -> tuple[Array, ...]:
         ensure_same_device(self, index)
         axis = normalize_axis(dim, self.ndim)
         if not isinstance(index, Tensor) or not index.dtype.is_integer:

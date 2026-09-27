@@ -3,11 +3,9 @@ from __future__ import annotations
 from contextlib import contextmanager
 from contextvars import ContextVar
 from types import MappingProxyType
-from typing import Callable
+from typing import Any as Array, Callable
 
-import numpy as np
-
-from .backends import ensure_same_device, get_backend, is_array, namespace, transfer
+from .backends import array_device, ensure_same_device, get_backend, is_array, namespace, transfer
 
 from ._backend import elementwise_derivative, normalized_exponential_forward
 from ._convolution import col2im, im2col
@@ -45,23 +43,30 @@ def enable_grad():
 
 
 class SavedArray:
-    __slots__ = ("_array", "_counter", "_version")
+    __slots__ = ("_array", "_counter", "_version", "_device")
 
-    def __init__(self, array: np.ndarray, version_counter):
+    def __init__(self, array: Array, version_counter):
         if not is_array(array):
             raise TypeError("Saved backward values must be registered backend arrays.")
         self._array = array
         self._counter = version_counter
         self._version = version_counter.value
+        self._device = array_device(array)
+
+    @property
+    def device(self):
+        return self._device
 
     def validate(self) -> None:
+        if array_device(self._array) != self._device:
+            raise RuntimeError(f"A value saved for backward changed device; expected {self._device}.")
         if self._counter.value != self._version:
             raise RuntimeError(
                 "A value saved for backward was modified in-place: "
                 f"expected storage version {self._version}, got {self._counter.value}."
             )
 
-    def unpack(self) -> np.ndarray:
+    def unpack(self) -> Array:
         self.validate()
         return self._array
 
@@ -78,12 +83,12 @@ class Context:
         if self._released:
             raise RuntimeError("The backward graph has been freed; use retain_graph=True on the earlier backward call.")
 
-    def save_array(self, array: np.ndarray, version_counter) -> None:
+    def save_array(self, array: Array, version_counter) -> None:
         self._ensure_live()
         self._saved += (SavedArray(array, version_counter),)
 
     @property
-    def saved_arrays(self) -> tuple[np.ndarray, ...]:
+    def saved_arrays(self) -> tuple[Array, ...]:
         self._ensure_live()
         return tuple(value.unpack() for value in self._saved)
 
@@ -99,14 +104,15 @@ class Context:
 
 
 class BackwardNode:
-    __slots__ = ("name", "context", "_parents", "_backward", "_released")
+    __slots__ = ("name", "context", "_parents", "_backward", "_released", "_device_transfer")
 
     def __init__(
         self,
         name: str,
         parents: tuple,
-        backward: Callable[[Context, np.ndarray], tuple[np.ndarray | None, ...]],
+        backward: Callable[[Context, Array], tuple[Array | None, ...]],
         context: Context,
+        *, device_transfer: bool = False,
     ):
         if not parents or any(not parent.requires_grad for parent in parents):
             raise ValueError("Backward nodes require parents with requires_grad=True.")
@@ -115,6 +121,11 @@ class BackwardNode:
         self._parents = tuple(parents)
         self._backward = backward
         self._released = False
+        if type(device_transfer) is not bool:
+            raise TypeError("device_transfer must be a Python bool.")
+        self._device_transfer = device_transfer
+        if not device_transfer:
+            ensure_same_device(*parents)
 
     @property
     def parents(self) -> tuple:
@@ -129,8 +140,13 @@ class BackwardNode:
             raise RuntimeError("The backward graph has been freed; use retain_graph=True on the earlier backward call.")
         self.context.validate()
 
-    def apply(self, gradient: np.ndarray) -> tuple[np.ndarray | None, ...]:
+    def apply(self, gradient: Array) -> tuple[Array | None, ...]:
         self.validate()
+        if not is_array(gradient) or gradient.dtype.kind != "f":
+            raise RuntimeError(f"Backward rule for {self.name} requires a floating backend gradient array.")
+        if not self._device_transfer:
+            ensure_same_device(gradient, *self.parents, *self.context.saved_arrays)
+            _validate_metadata_device(self.context.metadata, array_device(gradient))
         with get_backend(gradient).context():
             contributions = self._backward(self.context, gradient)
         if not isinstance(contributions, tuple) or len(contributions) != len(self.parents):
@@ -144,7 +160,51 @@ class BackwardNode:
         self._released = True
 
 
-def sum_to_shape(gradient: np.ndarray, shape: tuple[int, ...]) -> np.ndarray:
+def _validate_metadata_device(value, device):
+    if is_array(value):
+        if array_device(value) != device:
+            raise RuntimeError(f"Saved backward metadata is on {array_device(value)}, expected {device}.")
+    elif isinstance(value, dict):
+        for item in value.values():
+            _validate_metadata_device(item, device)
+    elif isinstance(value, (tuple, list)):
+        for item in value:
+            _validate_metadata_device(item, device)
+
+
+def validate_gradient(parent, gradient, operation="gradient", *, exact_dtype=False) -> None:
+    if not is_array(gradient):
+        raise RuntimeError(f"{operation} must be a registered backend gradient array.")
+    if gradient.shape != parent.shape:
+        raise RuntimeError(f"{operation} has invalid gradient shape {gradient.shape}; expected {parent.shape}.")
+    if not parent.dtype.can_require_grad or gradient.dtype.kind != "f" or gradient.dtype.itemsize not in (4, 8):
+        raise RuntimeError(f"{operation} requires supported floating gradients and a floating parent, got {gradient.dtype} and {parent.dtype}.")
+    ensure_same_device(parent, gradient)
+    if exact_dtype and gradient.dtype != parent.dtype.numpy_dtype:
+        raise RuntimeError(f"{operation} has gradient dtype {gradient.dtype}; expected {parent.dtype}.")
+
+
+def validate_accumulation(parent, gradient) -> None:
+    validate_gradient(parent, gradient, "Gradient accumulation")
+    existing = parent.grad
+    if existing is not None:
+        array = getattr(existing, "_data", None)
+        validate_gradient(parent, array, "Stored gradient", exact_dtype=True)
+        if existing.requires_grad or existing.grad_fn is not None:
+            raise RuntimeError("Stored gradients must be detached from autograd.")
+
+
+def accumulate_gradient(parent, gradient, existing=None, operation="Gradient accumulation"):
+    validate_gradient(parent, gradient, operation)
+    xp = namespace(parent)
+    converted = xp.asarray(gradient, dtype=parent.dtype.numpy_dtype)
+    if existing is None:
+        return xp.array(converted, copy=True, order="C")
+    validate_gradient(parent, existing, "Stored gradient", exact_dtype=True)
+    return xp.asarray(xp.add(existing, converted), dtype=parent.dtype.numpy_dtype)
+
+
+def sum_to_shape(gradient: Array, shape: tuple[int, ...]) -> Array:
     xp = namespace(gradient)
     gradient = xp.asarray(gradient)
     leading = gradient.ndim - len(shape)
@@ -162,11 +222,11 @@ def sum_to_shape(gradient: np.ndarray, shape: tuple[int, ...]) -> np.ndarray:
     return gradient.reshape(shape)
 
 
-def addition_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray, ...]:
+def addition_backward(context: Context, gradient: Array) -> tuple[Array, ...]:
     return tuple(sum_to_shape(gradient, shape) for shape in context.metadata["parent_shapes"])
 
 
-def identity_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray]:
+def identity_backward(context: Context, gradient: Array) -> tuple[Array]:
     return (gradient,)
 
 
@@ -174,25 +234,25 @@ def transfer_backward(context: Context, gradient) -> tuple:
     return (transfer(gradient, context.metadata["device"], context.metadata["dtype"]),)
 
 
-def subtraction_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray, ...]:
+def subtraction_backward(context: Context, gradient: Array) -> tuple[Array, ...]:
     return tuple(
         sum_to_shape(gradient if index == 0 else -gradient, shape)
         for index, shape in zip(context.metadata["parent_indices"], context.metadata["parent_shapes"])
     )
 
 
-def negation_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray]:
+def negation_backward(context: Context, gradient: Array) -> tuple[Array]:
     return (sum_to_shape(-gradient, context.metadata["parent_shapes"][0]),)
 
 
-def _saved_operands(context: Context) -> dict[int, np.ndarray]:
+def _saved_operands(context: Context) -> dict[int, Array]:
     return {
         index: array.astype(context.metadata["compute_dtype"], copy=False)
         for index, array in zip(context.metadata["saved_indices"], context.saved_arrays)
     }
 
 
-def conv2d_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray, ...]:
+def conv2d_backward(context: Context, gradient: Array) -> tuple[Array, ...]:
     xp = namespace(gradient)
     metadata = context.metadata
     operands = _saved_operands(context)
@@ -232,7 +292,7 @@ def conv2d_node(input, weight, bias, stride, padding, dilation, groups, output_s
     return BackwardNode("conv2d", tuple(operands[index] for index in parent_indices), conv2d_backward, context)
 
 
-def pooling_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray]:
+def pooling_backward(context: Context, gradient: Array) -> tuple[Array]:
     metadata = context.metadata
     if metadata["operation"] == "max_pool2d":
         result = max_pool2d_backward(gradient, metadata["input_shape"], metadata["indices"])
@@ -246,7 +306,7 @@ def pooling_node(operation, input, **metadata) -> BackwardNode:
     return BackwardNode(operation, (input,), pooling_backward, context)
 
 
-def multiplication_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray, ...]:
+def multiplication_backward(context: Context, gradient: Array) -> tuple[Array, ...]:
     operands = _saved_operands(context)
     return tuple(
         sum_to_shape(gradient * operands[1 - index], shape)
@@ -254,7 +314,7 @@ def multiplication_backward(context: Context, gradient: np.ndarray) -> tuple[np.
     )
 
 
-def division_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray, ...]:
+def division_backward(context: Context, gradient: Array) -> tuple[Array, ...]:
     operands = _saved_operands(context)
     denominator = operands[1]
     contributions = []
@@ -267,7 +327,7 @@ def division_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarra
     return tuple(contributions)
 
 
-def power_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray, ...]:
+def power_backward(context: Context, gradient: Array) -> tuple[Array, ...]:
     xp = namespace(gradient)
     operands = _saved_operands(context)
     exponent = operands[1]
@@ -288,7 +348,7 @@ def power_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray, 
     return tuple(contributions)
 
 
-def matmul_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray, ...]:
+def matmul_backward(context: Context, gradient: Array) -> tuple[Array, ...]:
     xp = namespace(gradient)
     operands = _saved_operands(context)
     left_vector, right_vector = context.metadata["vector_operands"]
@@ -356,26 +416,26 @@ def arithmetic_node(operation: str, operands: tuple, compute_dtype) -> BackwardN
     return BackwardNode(operation, parents, ARITHMETIC_BACKWARD_RULES[operation], context)
 
 
-def reshape_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray]:
+def reshape_backward(context: Context, gradient: Array) -> tuple[Array]:
     return (gradient.reshape(context.metadata["original_shape"], order="C"),)
 
 
-def squeeze_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray]:
+def squeeze_backward(context: Context, gradient: Array) -> tuple[Array]:
     xp = namespace(gradient)
     return (xp.expand_dims(gradient, axis=context.metadata["removed_axes"]),)
 
 
-def unsqueeze_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray]:
+def unsqueeze_backward(context: Context, gradient: Array) -> tuple[Array]:
     xp = namespace(gradient)
     return (xp.squeeze(gradient, axis=context.metadata["added_axis"]),)
 
 
-def transpose_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray]:
+def transpose_backward(context: Context, gradient: Array) -> tuple[Array]:
     first, second = context.metadata["axes"]
     return (gradient.swapaxes(first, second),)
 
 
-def permutation_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray]:
+def permutation_backward(context: Context, gradient: Array) -> tuple[Array]:
     permutation = context.metadata["permutation"]
     inverse = [0] * len(permutation)
     for output_axis, input_axis in enumerate(permutation):
@@ -383,11 +443,11 @@ def permutation_backward(context: Context, gradient: np.ndarray) -> tuple[np.nda
     return (gradient.transpose(tuple(inverse)),)
 
 
-def expand_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray]:
+def expand_backward(context: Context, gradient: Array) -> tuple[Array]:
     return (sum_to_shape(gradient, context.metadata["original_shape"]),)
 
 
-def repeat_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray]:
+def repeat_backward(context: Context, gradient: Array) -> tuple[Array]:
     xp = namespace(gradient)
     shape = context.metadata["original_shape"]
     repeats = context.metadata["repeats"]
@@ -398,14 +458,14 @@ def repeat_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray]
     return (xp.asarray(contribution).reshape(shape),)
 
 
-def repeat_interleave_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray]:
+def repeat_interleave_backward(context: Context, gradient: Array) -> tuple[Array]:
     shape = context.metadata["original_shape"]
     axis = context.metadata["axis"]
     expanded = shape[:axis + 1] + (context.metadata["repeats"],) + shape[axis + 1:]
     return (gradient.reshape(expanded).sum(axis=axis + 1, dtype=gradient.dtype),)
 
 
-def triangular_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray]:
+def triangular_backward(context: Context, gradient: Array) -> tuple[Array]:
     xp = namespace(gradient)
     function = xp.triu if context.metadata["upper"] else xp.tril
     return (function(gradient, k=context.metadata["diagonal"]),)
@@ -450,18 +510,18 @@ def transform_node(operation: str, parent, permutation: tuple[int, ...] | None, 
     return BackwardNode(operation, (parent,), TRANSFORM_BACKWARD_RULES[operation], context)
 
 
-def _broadcast_reduction_gradient(context: Context, gradient: np.ndarray) -> np.ndarray:
+def _broadcast_reduction_gradient(context: Context, gradient: Array) -> Array:
     xp = namespace(gradient)
     if not context.metadata["keepdim"]:
         gradient = xp.expand_dims(gradient, axis=context.metadata["axes"])
     return xp.broadcast_to(gradient, context.metadata["original_shape"])
 
 
-def sum_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray]:
+def sum_backward(context: Context, gradient: Array) -> tuple[Array]:
     return (_broadcast_reduction_gradient(context, gradient),)
 
 
-def logsumexp_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray]:
+def logsumexp_backward(context: Context, gradient: Array) -> tuple[Array]:
     xp = namespace(gradient)
     if not context.metadata["axes"]:
         return (gradient,)
@@ -469,16 +529,16 @@ def logsumexp_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarr
     weights = normalized_exponential_forward("softmax", value, context.metadata["axes"])
     expanded = _broadcast_reduction_gradient(context, gradient)
     output = xp.zeros_like(value)
-    with np.errstate(under="ignore"):
+    with xp.errstate(under="ignore"):
         xp.multiply(expanded, weights, out=output, where=weights != 0)
     return (output,)
 
 
-def normalized_exponential_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray]:
+def normalized_exponential_backward(context: Context, gradient: Array) -> tuple[Array]:
     xp = namespace(gradient)
     output, = context.saved_arrays
     axis = context.metadata["axis"]
-    with np.errstate(under="ignore"):
+    with xp.errstate(under="ignore"):
         if context.metadata["operation"] == "softmax":
             dot = xp.sum(gradient * output, axis=axis, keepdims=True, dtype=gradient.dtype)
             contribution = output * (gradient - dot)
@@ -495,13 +555,13 @@ def normalized_exponential_node(operation: str, parent, output, axis: int) -> Ba
     return BackwardNode(operation, (parent,), normalized_exponential_backward, context)
 
 
-def mean_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray]:
+def mean_backward(context: Context, gradient: Array) -> tuple[Array]:
     xp = namespace(gradient)
     count = xp.asarray(context.metadata["count"], dtype=gradient.dtype)
     return (xp.asarray(_broadcast_reduction_gradient(context, gradient) / count),)
 
 
-def product_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray]:
+def product_backward(context: Context, gradient: Array) -> tuple[Array]:
     xp = namespace(gradient)
     data, = context.saved_arrays
     axes = context.metadata["axes"]
@@ -514,7 +574,7 @@ def product_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray
     return (xp.asarray(_broadcast_reduction_gradient(context, gradient) * derivative),)
 
 
-def extremum_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray]:
+def extremum_backward(context: Context, gradient: Array) -> tuple[Array]:
     xp = namespace(gradient)
     data, = context.saved_arrays
     axes = context.metadata["axes"]
@@ -522,12 +582,12 @@ def extremum_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarra
     extremum = function(data, axis=axes, keepdims=True)
     mask = data == extremum
     count = xp.sum(mask, axis=axes, keepdims=True)
-    derivative = xp.full_like(data, np.nan)
+    derivative = xp.full_like(data, float("nan"))
     xp.divide(mask, count, out=derivative, where=count != 0)
     return (xp.asarray(_broadcast_reduction_gradient(context, gradient) * derivative),)
 
 
-def moment_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray]:
+def moment_backward(context: Context, gradient: Array) -> tuple[Array]:
     xp = namespace(gradient)
     data, = context.saved_arrays
     axes = context.metadata["axes"]
@@ -584,7 +644,7 @@ ELEMENTWISE_BACKWARD_OPERATIONS = frozenset((
 _OUTPUT_DERIVATIVES = frozenset(("exp", "sqrt", "rsqrt", "tanh", "sigmoid"))
 
 
-def elementwise_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray]:
+def elementwise_backward(context: Context, gradient: Array) -> tuple[Array]:
     xp = namespace(gradient)
     value, = context.saved_arrays
     derivative = elementwise_derivative(context.metadata["operation"], value, context.metadata)
@@ -598,7 +658,7 @@ def elementwise_node(operation: str, parent, output, parameters: tuple) -> Backw
     return BackwardNode(operation, (parent,), elementwise_backward, context)
 
 
-def binary_extremum_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray, ...]:
+def binary_extremum_backward(context: Context, gradient: Array) -> tuple[Array, ...]:
     xp = namespace(gradient)
     operands = _saved_operands(context)
     left, right = operands[0], operands[1]
@@ -609,11 +669,11 @@ def binary_extremum_backward(context: Context, gradient: np.ndarray) -> tuple[np
     for index, shape in zip(context.metadata["parent_indices"], context.metadata["parent_shapes"]):
         first, second = (left, right) if index == 0 else (right, left)
         local = xp.where(comparison(first, second), gradient, xp.where(equal, gradient * 0.5, 0))
-        contributions.append(sum_to_shape(xp.where(invalid, np.nan, local), shape))
+        contributions.append(sum_to_shape(xp.where(invalid, float("nan"), local), shape))
     return tuple(contributions)
 
 
-def where_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray, ...]:
+def where_backward(context: Context, gradient: Array) -> tuple[Array, ...]:
     xp = namespace(gradient)
     condition, = context.saved_arrays
     return tuple(
@@ -622,13 +682,13 @@ def where_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray, 
     )
 
 
-def clamp_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray, ...]:
+def clamp_backward(context: Context, gradient: Array) -> tuple[Array, ...]:
     xp = namespace(gradient)
     operands = _saved_operands(context)
     value = operands[0]
     lower_index = 1 if context.metadata["has_min"] else None
     upper_index = 1 + int(context.metadata["has_min"]) if context.metadata["has_max"] else None
-    interior = xp.ones(value.shape, dtype=np.bool_)
+    interior = xp.ones(value.shape, dtype=bool)
     invalid = xp.isnan(value)
     if lower_index is not None:
         interior &= value > operands[lower_index]
@@ -648,7 +708,7 @@ def clamp_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray, 
         if index != 0 and lower_index is not None and upper_index is not None:
             shared_boundary = (value == operands[lower_index]) & (value == operands[upper_index])
             local = xp.where(shared_boundary, gradient * 0.5, local)
-        local = xp.where(invalid, np.nan, local)
+        local = xp.where(invalid, float("nan"), local)
         contributions.append(sum_to_shape(local, shape))
     return tuple(contributions)
 
@@ -677,7 +737,7 @@ def selection_node(operation: str, operands: tuple, compute_dtype, parameters: t
     return BackwardNode(operation, parents, SELECTION_BACKWARD_RULES[operation], context)
 
 
-def stack_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray, ...]:
+def stack_backward(context: Context, gradient: Array) -> tuple[Array, ...]:
     xp = namespace(gradient)
     return tuple(xp.asarray(xp.take(gradient, index, axis=context.metadata["axis"])) for index in context.metadata["indices"])
 
@@ -688,7 +748,7 @@ def stack_node(operands: tuple, axis: int) -> BackwardNode:
     return BackwardNode("stack", tuple(operands[index] for index in indices), stack_backward, context)
 
 
-def cat_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray, ...]:
+def cat_backward(context: Context, gradient: Array) -> tuple[Array, ...]:
     axis = context.metadata["axis"]
     contributions = []
     for start, stop in context.metadata["segments"]:
@@ -709,7 +769,7 @@ def cat_node(operands: tuple, axis: int) -> BackwardNode:
     return BackwardNode("cat", tuple(parents), cat_backward, Context(axis=axis, segments=tuple(segments)))
 
 
-def indexing_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray]:
+def indexing_backward(context: Context, gradient: Array) -> tuple[Array]:
     xp = namespace(gradient)
     contribution = xp.zeros(context.metadata["original_shape"], dtype=gradient.dtype)
     index = context.metadata["index"]
@@ -725,7 +785,7 @@ def indexing_node(operation: str, parent, index: tuple, is_advanced: bool) -> Ba
     return BackwardNode(operation, (parent,), indexing_backward, context)
 
 
-def embedding_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray]:
+def embedding_backward(context: Context, gradient: Array) -> tuple[Array]:
     xp = namespace(gradient)
     shape = context.metadata["weight_shape"]
     indices = context.metadata["indices"].reshape(-1)
@@ -739,12 +799,12 @@ def embedding_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarr
     return (contribution,)
 
 
-def embedding_node(weight, indices: np.ndarray, padding_idx: int | None) -> BackwardNode:
+def embedding_node(weight, indices: Array, padding_idx: int | None) -> BackwardNode:
     context = Context(weight_shape=weight.shape, indices=indices, padding_idx=padding_idx)
     return BackwardNode("embedding", (weight,), embedding_backward, context)
 
 
-def scatter_add_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray, ...]:
+def scatter_add_backward(context: Context, gradient: Array) -> tuple[Array, ...]:
     xp = namespace(gradient)
     return tuple(
         gradient if position == 0 else sum_to_shape(xp.asarray(gradient[context.metadata["index"]]), shape)
@@ -752,7 +812,7 @@ def scatter_add_backward(context: Context, gradient: np.ndarray) -> tuple[np.nda
     )
 
 
-def scatter_add_node(input, source, coordinates: tuple[np.ndarray, ...]) -> BackwardNode:
+def scatter_add_node(input, source, coordinates: tuple[Array, ...]) -> BackwardNode:
     operands = (input, source)
     positions = tuple(position for position, operand in enumerate(operands) if operand.requires_grad)
     parents = tuple(operands[position] for position in positions)
@@ -790,8 +850,9 @@ def _topological_order(output) -> list:
     return order
 
 
-def run_backward(output, gradient: np.ndarray, retain_graph: bool) -> None:
+def run_backward(output, gradient: Array, retain_graph: bool) -> None:
     with no_grad():
+        validate_gradient(output, gradient, "Backward seed")
         order = _topological_order(output)
         gradients = {id(output): gradient}
         accumulated = []
@@ -807,17 +868,10 @@ def run_backward(output, gradient: np.ndarray, retain_graph: bool) -> None:
             for parent, contribution in zip(node.parents, node.apply(incoming)):
                 if contribution is None:
                     continue
-                if not is_array(contribution) or contribution.shape != parent.shape:
-                    raise RuntimeError(f"Backward rule for {node.name} returned an invalid gradient for shape {parent.shape}.")
-                if contribution.dtype.kind != "f":
-                    raise RuntimeError(f"Backward rule for {node.name} must return floating gradients.")
-                ensure_same_device(parent, contribution)
-                contribution = namespace(parent).array(contribution, dtype=parent.dtype.numpy_dtype, copy=True)
                 identity = id(parent)
-                if identity in gradients:
-                    namespace(parent).add(gradients[identity], contribution, out=gradients[identity])
-                else:
-                    gradients[identity] = contribution
+                gradients[identity] = accumulate_gradient(parent, contribution, gradients.get(identity), f"Backward rule for {node.name}")
+        for value, incoming in accumulated:
+            validate_accumulation(value, incoming)
         for value, incoming in accumulated:
             value._accumulate_grad(incoming)
         if not retain_graph:

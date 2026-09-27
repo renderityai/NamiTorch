@@ -85,12 +85,14 @@ def same_device(function):
     return checked
 
 
-def transfer(array, target, dtype=None, copy=True):
+def transfer(array, target, dtype=None, copy=True, *, non_blocking=False):
+    if type(copy) is not bool or type(non_blocking) is not bool:
+        raise TypeError("Transfer copy and non_blocking arguments must be Python bools.")
     source = get_backend(array)
     destination = get_backend(target)
     if source.device.type != destination.device.type and destination.device.type == "cpu":
         array = source.to_numpy(array)
-    return destination.array(array, dtype=dtype, copy=copy)
+    return destination.array(array, dtype=dtype, copy=copy, non_blocking=non_blocking)
 
 
 def writable(array):

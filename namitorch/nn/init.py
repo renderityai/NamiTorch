@@ -34,7 +34,7 @@ def _real(value: object, name: str, tensor: Tensor) -> float:
 
 def constant_(tensor: Tensor, value: object, *, generator: Generator | None = None) -> Tensor:
     _tensor(tensor)
-    _validate_generator(generator)
+    _validate_generator(generator, tensor.device)
     with no_grad():
         return tensor.fill_(value)
 
@@ -49,7 +49,7 @@ def ones_(tensor: Tensor, *, generator: Generator | None = None) -> Tensor:
 
 def uniform_(tensor: Tensor, a: float = 0.0, b: float = 1.0, *, generator: Generator | None = None) -> Tensor:
     _tensor(tensor, floating=True)
-    _validate_generator(generator)
+    _validate_generator(generator, tensor.device)
     lower, upper = _real(a, "a", tensor), _real(b, "b", tensor)
     if lower > upper:
         raise ValueError("uniform_ requires a <= b.")
@@ -63,7 +63,7 @@ def uniform_(tensor: Tensor, a: float = 0.0, b: float = 1.0, *, generator: Gener
 
 def normal_(tensor: Tensor, mean: float = 0.0, std: float = 1.0, *, generator: Generator | None = None) -> Tensor:
     _tensor(tensor, floating=True)
-    _validate_generator(generator)
+    _validate_generator(generator, tensor.device)
     center, deviation = _real(mean, "mean", tensor), _real(std, "std", tensor)
     if deviation <= 0 or tensor.dtype.numpy_dtype.type(deviation) == 0:
         raise ValueError("normal_ requires a positive, representable std.")
@@ -167,7 +167,7 @@ def _normal_interval_probability(lower: float, upper: float) -> float:
 def trunc_normal_(tensor: Tensor, mean: float = 0.0, std: float = 1.0, a: float = -2.0, b: float = 2.0, *, generator: Generator | None = None) -> Tensor:
     xp = namespace(tensor)
     _tensor(tensor, floating=True)
-    _validate_generator(generator)
+    _validate_generator(generator, tensor.device)
     center, deviation = _real(mean, "mean", tensor), _real(std, "std", tensor)
     lower, upper = _real(a, "a", tensor), _real(b, "b", tensor)
     if deviation <= 0 or tensor.dtype.numpy_dtype.type(deviation) == 0:
@@ -184,7 +184,7 @@ def trunc_normal_(tensor: Tensor, mean: float = 0.0, std: float = 1.0, a: float 
         raise ValueError("trunc_normal_ interval contains no value representable in the Tensor dtype.")
     count = tensor.numel()
     values = xp.empty(count, dtype=tensor.dtype.numpy_dtype)
-    rng = _get_rng(generator)
+    rng = _get_rng(generator, device=tensor.device)
     filled = 0
     remaining_draws = max(10000, math.ceil(10 * count / acceptance))
     while filled < count:

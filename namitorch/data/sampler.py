@@ -22,7 +22,7 @@ class RandomSampler:
     def __init__(self, data_source, replacement: bool = False, num_samples: int | None = None, *, generator: Generator | None = None):
         if type(replacement) is not bool:
             raise TypeError("replacement must be a Python bool.")
-        _validate_generator(generator)
+        _validate_generator(generator, "cpu")
         if num_samples is not None:
             if isinstance(num_samples, (bool, np.bool_)):
                 raise TypeError("num_samples must be an integer, not a boolean.")

@@ -16,7 +16,7 @@ class DataLoader:
     ):
         shuffle = False if shuffle is None else boolean(shuffle, "shuffle")
         drop_last = boolean(drop_last, "drop_last")
-        _validate_generator(generator)
+        _validate_generator(generator, "cpu")
         if collate_fn is not None and not callable(collate_fn):
             raise TypeError("collate_fn must be callable or None.")
         if batch_sampler is not None and (batch_size is not _DEFAULT_BATCH_SIZE or shuffle or sampler is not None or drop_last):

@@ -1,7 +1,6 @@
-from threading import RLock
-
 import numpy as np
 
+from ._cuda_random import CUDARandom
 from ._cuda_runtime import load_cupy, runtime_call
 from ._namespace import ArrayNamespace
 
@@ -17,19 +16,31 @@ class CUDABackend:
         self.array_type = module.ndarray
         self.namespace = ArrayNamespace(self)
         self._erfc = module.ElementwiseKernel("T x", "T y", "y = erfc(x);", "namitorch_erfc")
-        self._rng = None
-        self._rng_lock = RLock()
 
     def context(self):
         return self.module.cuda.Device(self.device.index)
 
-    def array(self, value, dtype=None, copy=True):
+    def array(self, value, dtype=None, copy=True, *, non_blocking=False):
+        device_input = isinstance(value, self.array_type)
+        cross_device = device_input and value.device.id != self.device.index
+        if cross_device:
+            with value.device:
+                self.module.cuda.get_current_stream().synchronize()
+            if not self.module.cuda.runtime.deviceCanAccessPeer(self.device.index, value.device.id):
+                with value.device:
+                    value = self.module.asnumpy(value, order="C", blocking=True)
+                device_input = False
         with self.context():
-            return self.module.array(value, dtype=dtype, copy=copy, order="C")
+            result = self.module.array(value, dtype=dtype, copy=copy, order="C")
+            if not non_blocking or not device_input or cross_device:
+                self.module.cuda.get_current_stream().synchronize()
+            if result.device.id != self.device.index:
+                raise RuntimeError(f"CUDA transfer produced storage on cuda:{result.device.id}, expected {self.device}.")
+            return result
 
     def to_numpy(self, array):
         with self.context():
-            return self.module.asnumpy(array, order="C")
+            return self.module.asnumpy(array, order="C", blocking=True)
 
     def writable(self, array):
         return True
@@ -53,24 +64,22 @@ class CUDABackend:
             else:
                 self.module.add.at(array, index, values)
 
+    def create_rng(self, seed):
+        return CUDARandom(self, seed)
+
+    def seed_rng(self, generator, seed):
+        generator.manual_seed(seed)
+
+    def rng_state(self, generator):
+        return generator.get_state()
+
+    def restore_rng(self, generator, state):
+        generator.set_state(state)
+
     def random(self, generator, operation, shape, dtype, **options):
-        dtype = np.float64 if dtype is None else dtype
-        seed = int(generator.integers(0, 2 ** 63, dtype=np.int64))
-        with self._rng_lock, self.context():
-            if self._rng is None:
-                self._rng = self.module.random.RandomState(seed)
-            else:
-                self._rng.seed(seed)
-            rng = self._rng
-            if operation == "permutation":
-                return rng.permutation(shape).astype(dtype, copy=False)
-            if operation == "choice":
-                return self.module.asarray(rng.choice(options["n"], size=shape, replace=options["replace"]), dtype=dtype)
-            if operation == "integers":
-                return rng.randint(options["low"], options["high"], size=shape, dtype=dtype)
-            if operation == "random":
-                return rng.random_sample(shape, dtype=dtype)
-            return rng.standard_normal(shape, dtype=dtype)
+        if not isinstance(generator, CUDARandom) or generator.device != self.device:
+            raise RuntimeError(f"CUDA random operations on {self.device} require a generator on the same device.")
+        return generator.draw(operation, shape, dtype, **options)
 
     def validate_index(self, array, index):
         if sum(component is Ellipsis for component in index) > 1:

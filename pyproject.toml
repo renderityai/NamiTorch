@@ -57,4 +57,4 @@ namitorch = ["namitorch.dtype", "namitorch.tensor", "namitorch.creation", "namit
 "namitorch.cli" = ["namitorch.training", "namitorch.models", "namitorch.backends", "namitorch.device"]
 "namitorch.device" = []
 "namitorch.backends" = ["namitorch.device"]
-"namitorch.cuda" = ["namitorch.backends", "namitorch.device"]
+"namitorch.cuda" = ["namitorch.backends", "namitorch.device", "namitorch.random"]

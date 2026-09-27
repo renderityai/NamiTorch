@@ -525,7 +525,7 @@ def dropout(input: Tensor, p: object = 0.5, training: bool = True, inplace: bool
         return input
     if not input.dtype.is_floating_point:
         raise TypeError("Training dropout requires a floating Tensor input.")
-    rng = _get_rng() if generator is None else _get_rng(generator)
+    rng = _get_rng(generator, device=input.device)
     mask = Tensor._from_array(xp.asarray(get_backend(input).random(rng, "random", input.shape, None) >= probability, dtype=input.dtype.numpy_dtype), False)
     denominator = Tensor(1 - probability, dtype=input.dtype, device=input.device)
     return input * mask / denominator

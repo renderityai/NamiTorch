@@ -167,7 +167,7 @@ class TokenShardBatcher(IterableDataset):
             raise TypeError("TokenShardBatcher requires a TokenShardDataset.")
         self.dataset = dataset
         self.batch_size = integer(batch_size, "batch_size", 1)
-        _validate_generator(generator)
+        _validate_generator(generator, "cpu")
         self.generator = generator
         self.num_batches = None if num_batches is None else integer(num_batches, "num_batches", 0)
         if not len(dataset):

@@ -1,6 +1,8 @@
 import math
 from types import MappingProxyType
 
+from typing import Any as Array
+
 import numpy as np
 
 from .backends import get_backend, namespace, readonly, same_device
@@ -51,11 +53,11 @@ UNARY_UFUNCS = MappingProxyType({
 @same_device
 def binary_forward(
     operation: str,
-    left: np.ndarray,
-    right: np.ndarray,
+    left: Array,
+    right: Array,
     compute_dtype: DType,
     output_dtype: DType,
-) -> np.ndarray:
+) -> Array:
     xp = namespace(left)
     shape = matmul_shape(left.shape, right.shape) if operation == "matmul" else broadcast_shapes(left.shape, right.shape)
     if compute_dtype.is_boolean and operation in ("subtract", "floor_divide", "remainder", "power"):
@@ -71,7 +73,7 @@ def binary_forward(
 
 
 @same_device
-def axis_index_coordinates(shape: tuple[int, ...], axis: int, index: np.ndarray) -> tuple[np.ndarray, ...]:
+def axis_index_coordinates(shape: tuple[int, ...], axis: int, index: Array) -> tuple[Array, ...]:
     xp = namespace(index)
     if index.ndim != len(shape):
         raise ValueError(f"Input and index must have the same rank, got shapes {shape} and {index.shape}.")
@@ -93,9 +95,9 @@ def axis_index_coordinates(shape: tuple[int, ...], axis: int, index: np.ndarray)
 
 @same_device
 def scatter_add_forward(
-    value: np.ndarray, coordinates: tuple[np.ndarray, ...], source: np.ndarray,
+    value: Array, coordinates: tuple[Array, ...], source: Array,
     index_shape: tuple[int, ...], dtype: DType,
-) -> np.ndarray:
+) -> Array:
     xp = namespace(value)
     try:
         broadcasted = xp.broadcast_to(source.astype(dtype.numpy_dtype, copy=False), index_shape)
@@ -107,7 +109,7 @@ def scatter_add_forward(
 
 
 @same_device
-def unary_forward(operation: str, value: np.ndarray, dtype: DType) -> np.ndarray:
+def unary_forward(operation: str, value: Array, dtype: DType) -> Array:
     xp = namespace(value)
     if dtype.is_boolean and operation in ("positive", "negative"):
         raise TypeError(f"{operation} is not defined for boolean operands.")
@@ -120,7 +122,7 @@ def unary_forward(operation: str, value: np.ndarray, dtype: DType) -> np.ndarray
 
 
 @same_device
-def _sigmoid(value: np.ndarray) -> np.ndarray:
+def _sigmoid(value: Array) -> Array:
     xp = namespace(value)
     output = xp.empty_like(value)
     positive = value >= 0
@@ -132,7 +134,7 @@ def _sigmoid(value: np.ndarray) -> np.ndarray:
 
 
 @same_device
-def _gelu(value: np.ndarray, approximation: str) -> np.ndarray:
+def _gelu(value: Array, approximation: str) -> Array:
     xp = namespace(value)
     output = xp.empty_like(value)
     if approximation == "exact":
@@ -153,9 +155,9 @@ def _gelu(value: np.ndarray, approximation: str) -> np.ndarray:
 
 @same_device
 def elementwise_forward(
-    operation: str, value: np.ndarray, dtype: DType,
+    operation: str, value: Array, dtype: DType,
     parameter: float | None = None, approximation: str | None = None,
-) -> np.ndarray:
+) -> Array:
     xp = namespace(value)
     data = value.astype(dtype.numpy_dtype, copy=False)
     if operation in UNARY_UFUNCS:
@@ -199,8 +201,8 @@ def elementwise_forward(
 
 @same_device
 def clamp_forward(
-    value: np.ndarray, minimum: np.ndarray | None, maximum: np.ndarray | None, dtype: DType
-) -> np.ndarray:
+    value: Array, minimum: Array | None, maximum: Array | None, dtype: DType
+) -> Array:
     xp = namespace(value)
     output = xp.array(value, dtype=dtype.numpy_dtype, copy=True, order="C")
     if minimum is not None:
@@ -211,7 +213,7 @@ def clamp_forward(
 
 
 @same_device
-def _gelu_derivative(value: np.ndarray, approximation: str) -> np.ndarray:
+def _gelu_derivative(value: Array, approximation: str) -> Array:
     xp = namespace(value)
     if approximation == "exact":
         output = xp.asarray(0.5 * get_backend(value).erfc(-value / math.sqrt(2)))
@@ -231,7 +233,7 @@ def _gelu_derivative(value: np.ndarray, approximation: str) -> np.ndarray:
 
 
 @same_device
-def elementwise_derivative(operation: str, value: np.ndarray, parameters: dict) -> np.ndarray:
+def elementwise_derivative(operation: str, value: Array, parameters: dict) -> Array:
     xp = namespace(value)
     if operation == "exp":
         derivative = value
@@ -295,7 +297,7 @@ def elementwise_derivative(operation: str, value: np.ndarray, parameters: dict) 
 
 
 @same_device
-def where_forward(condition: np.ndarray, left: np.ndarray, right: np.ndarray, dtype: DType) -> np.ndarray:
+def where_forward(condition: Array, left: Array, right: Array, dtype: DType) -> Array:
     xp = namespace(condition)
     try:
         broadcast_shapes(condition.shape, broadcast_shapes(left.shape, right.shape))
@@ -308,8 +310,8 @@ def where_forward(condition: np.ndarray, left: np.ndarray, right: np.ndarray, dt
 
 @same_device
 def normalized_exponential_forward(
-    operation: str, value: np.ndarray, axes: tuple[int, ...], keepdim: bool = True,
-) -> np.ndarray:
+    operation: str, value: Array, axes: tuple[int, ...], keepdim: bool = True,
+) -> Array:
     xp = namespace(value)
     if operation == "logsumexp" and not axes:
         return value.copy()
@@ -342,13 +344,13 @@ def normalized_exponential_forward(
 @same_device
 def reduction_forward(
     operation: str,
-    value: np.ndarray,
+    value: Array,
     axes: tuple[int, ...],
     keepdim: bool,
     dtype: DType,
     count: int,
     correction: float | None,
-) -> np.ndarray:
+) -> Array:
     xp = namespace(value)
     if operation in ("mean", "min", "max", "amin", "amax", "argmin", "argmax", "var", "std") and count == 0:
         raise ValueError(f"{operation} cannot reduce an empty group for shape {value.shape} and axes {axes}.")

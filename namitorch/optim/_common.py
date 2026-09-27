@@ -1,5 +1,6 @@
 import math
 from numbers import Real
+from typing import Any as Array
 
 import numpy as np
 
@@ -52,7 +53,7 @@ def _buffer(state: dict, name: str, parameter: Tensor) -> Tensor:
     return state[name]
 
 
-def _gradient(parameter: Tensor, gradient: Tensor, options: dict, decoupled: bool = False) -> np.ndarray:
+def _gradient(parameter: Tensor, gradient: Tensor, options: dict, decoupled: bool = False) -> Array:
     xp = namespace(parameter)
     result = gradient._data.copy()
     if options["maximize"]:
@@ -62,7 +63,7 @@ def _gradient(parameter: Tensor, gradient: Tensor, options: dict, decoupled: boo
     return result
 
 
-def _apply_update(parameter: Tensor, update: np.ndarray, options: dict, decoupled: bool = False) -> None:
+def _apply_update(parameter: Tensor, update: Array, options: dict, decoupled: bool = False) -> None:
     if options["lr"] == 0:
         return
     values = parameter._data

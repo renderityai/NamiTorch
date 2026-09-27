@@ -4,7 +4,7 @@ from ..autograd import no_grad
 from ..nn.module import Module
 from ..optim.optimizer import Optimizer
 from ..optim.lr_scheduler import LRScheduler
-from ..random import Generator, _default_generator
+from ..random import Generator, _default_generator, _cuda_states, _prepare_cuda_states, _install_cuda_defaults
 from ..serialization import SerializationError, load, save
 
 
@@ -90,6 +90,7 @@ def save_checkpoint(path, model, optimizer=None, scheduler=None, *, step=0, epoc
         "scheduler": None if scheduler is None else scheduler.state_dict(),
         "rng": {
             "default": _default_generator.get_state(),
+            "cuda": _cuda_states(),
             "generators": {name: generator.get_state() for name, generator in generators.items()},
         },
         "step": _counter(step, "step"),
@@ -101,22 +102,25 @@ def save_checkpoint(path, model, optimizer=None, scheduler=None, *, step=0, epoc
 
 
 def _prepare_rng(state, generators):
-    if type(state) is not dict or set(state) != {"default", "generators"} or type(state["generators"]) is not dict:
+    if type(state) is not dict or set(state) not in ({"default", "generators"}, {"default", "cuda", "generators"}) or type(state["generators"]) is not dict:
         raise SerializationError("Invalid checkpoint RNG fields.")
     if set(state["generators"]) != set(generators):
         raise ValueError("Named generators must match the saved checkpoint exactly when restoring RNG.")
     requests = [(_default_generator, state["default"])]
     requests.extend((generator, state["generators"][name]) for name, generator in generators.items())
+    cuda_update = _prepare_cuda_states(state["cuda"]) if "cuda" in state else None
+    if cuda_update is not None:
+        requests.extend(cuda_update[1])
     prepared = {}
     for generator, saved in requests:
-        validator = Generator(0)
+        validator = Generator(0, device=generator.device)
         validator.set_state(saved)
         validated = validator.get_state()
         identity = id(generator)
         if identity in prepared and prepared[identity][1] != validated:
             raise ValueError("Conflicting checkpoint states for aliased generators.")
         prepared[identity] = (generator, validated)
-    return tuple(prepared.values())
+    return tuple(prepared.values()), cuda_update
 
 
 def load_checkpoint(path, model, optimizer=None, scheduler=None, *, generators=None, strict=True, restore_rng=True, max_array_bytes=None):
@@ -143,7 +147,7 @@ def load_checkpoint(path, model, optimizer=None, scheduler=None, *, generators=N
         scheduler_update = scheduler._prepare_load_state_dict(checkpoint["scheduler"])
         if [group["lr"] for group in optimizer_update[1]] != scheduler_update[3]:
             raise ValueError("Checkpoint optimizer learning rates disagree with the scheduler state.")
-    rng_updates = _prepare_rng(checkpoint["rng"], generators) if restore_rng else ()
+    rng_updates, cuda_update = _prepare_rng(checkpoint["rng"], generators) if restore_rng else ((), None)
     with no_grad():
         for _, target, snapshot in model_updates:
             target.copy_(snapshot)
@@ -153,6 +157,8 @@ def load_checkpoint(path, model, optimizer=None, scheduler=None, *, generators=N
         scheduler._apply_loaded_state(scheduler_update)
     for generator, state in rng_updates:
         generator.set_state(state)
+    if cuda_update is not None:
+        _install_cuda_defaults(*cuda_update)
     info["load_result"] = result
     return info
 

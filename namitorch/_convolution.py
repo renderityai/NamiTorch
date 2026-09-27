@@ -1,5 +1,3 @@
-import numpy as np
-
 from .backends import namespace, same_device
 
 

@@ -49,4 +49,15 @@ def get_device_name(index=None):
     return get_device_properties(index)["name"]
 
 
-__all__ = ["is_available", "device_count", "current_device", "set_device", "get_device_name", "get_device_properties"]
+def manual_seed(seed):
+    from .random import _get_default_generator, _seed
+    value = _seed(seed)
+    _get_default_generator(Device("cuda", current_device())).manual_seed(value)
+
+
+def manual_seed_all(seed):
+    from .random import _manual_seed_cuda_all
+    _manual_seed_cuda_all(seed)
+
+
+__all__ = ["is_available", "device_count", "current_device", "set_device", "get_device_name", "get_device_properties", "manual_seed", "manual_seed_all"]
