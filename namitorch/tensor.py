@@ -9,6 +9,9 @@ from numbers import Real
 
 import numpy as np
 
+from .backends import array_device, ensure_same_device, get_backend, is_array, namespace, readonly, same_device, transfer, writable
+from .device import Device
+
 from ._backend import (
     axis_index_coordinates,
     binary_forward,
@@ -38,6 +41,7 @@ from .autograd import (
     scatter_add_node,
     selection_node,
     transform_node,
+    transfer_backward,
 )
 from .dtype import (
     DType,
@@ -114,7 +118,7 @@ def _storage_owner(array: np.ndarray) -> object:
 
 
 def _shares_storage(left: np.ndarray, right: np.ndarray) -> bool:
-    return _storage_owner(left) is _storage_owner(right) or np.shares_memory(left, right)
+    return array_device(left) == array_device(right) and (_storage_owner(left) is _storage_owner(right) or namespace(left).shares_memory(left, right))
 
 
 def _storage_version(array: np.ndarray, preferred: _VersionCounter | None = None) -> _VersionCounter:
@@ -192,12 +196,10 @@ def _index_array(array: np.ndarray) -> np.ndarray:
         limits = np.iinfo(np.intp)
         if builtins.int(array.min()) < limits.min or builtins.int(array.max()) > limits.max:
             raise IndexError("An integer array index is outside the supported indexing range.")
-    snapshot = np.array(array, copy=True, order="C", subok=False)
-    snapshot.flags.writeable = False
-    return snapshot
+    return readonly(namespace(array).array(array, copy=True, order="C", subok=False))
 
 
-def _normalize_index_component(index: object) -> object:
+def _normalize_index_component(index: object, device: Device) -> object:
     if index is None or index is Ellipsis:
         return index
     if isinstance(index, slice):
@@ -206,10 +208,14 @@ def _normalize_index_component(index: object) -> object:
             raise ValueError("Slice step must not be zero.")
         return slice(start, stop, step)
     if isinstance(index, Tensor):
+        if index.device != device:
+            raise RuntimeError(f"Index is on {index.device}, but Tensor is on {device}; use .to() explicitly.")
         if not (index.dtype.is_integer or index.dtype.is_boolean):
             raise TypeError(f"Tensor indices must have integer or boolean dtype, got {index.dtype.name}.")
         return _index_array(index._data)
-    if isinstance(index, np.ndarray):
+    if is_array(index):
+        if array_device(index) != device:
+            raise RuntimeError(f"Index array is on {array_device(index)}, but Tensor is on {device}.")
         return _index_array(index)
     if isinstance(index, (list, tuple)):
         sequence = _index_sequence(index, set())
@@ -219,15 +225,15 @@ def _normalize_index_component(index: object) -> object:
             raise IndexError("Index sequences must form a rectangular integer or boolean array.") from None
         if array.size == 0:
             array = array.astype(np.intp)
-        return _index_array(array)
+        return _index_array(get_backend(device).array(array))
     if isinstance(index, (builtins.bool, np.bool_)):
         return builtins.bool(index)
     return _index_integer(index)
 
 
-def _normalize_index(index: object) -> tuple[object, ...]:
+def _normalize_index(index: object, device: Device) -> tuple[object, ...]:
     components = index if isinstance(index, tuple) else (index,)
-    return tuple(_normalize_index_component(component) for component in components)
+    return tuple(_normalize_index_component(component, device) for component in components)
 
 
 def _scalar_index_view(array: np.ndarray, index: tuple[object, ...]) -> np.ndarray:
@@ -239,7 +245,7 @@ def _scalar_index_view(array: np.ndarray, index: tuple[object, ...]) -> np.ndarr
 def _infer_data_dtype(data: object, active_sequences: set[int]) -> DType | None:
     if isinstance(data, Tensor):
         return data.dtype
-    if isinstance(data, (np.ndarray, np.generic)):
+    if is_array(data) or isinstance(data, np.generic):
         return from_numpy_dtype(data.dtype)
     if isinstance(data, (builtins.bool, builtins.int, builtins.float)):
         return result_type(data)
@@ -285,20 +291,23 @@ def _integer_argument(value, name, minimum=None):
     return value
 
 
-def _make_array(data: object, dtype: DType, *, copy: builtins.bool) -> np.ndarray:
+def _make_array(data: object, dtype: DType, *, copy: builtins.bool, device=None):
+    backend = get_backend(device)
     source = data._data if isinstance(data, Tensor) else data
-    if isinstance(source, np.ndarray):
+    if is_array(source):
         can_share = (
-            source.dtype == dtype.numpy_dtype
+            array_device(source) == backend.device
+            and source.dtype == dtype.numpy_dtype
             and source.dtype.isnative
             and source.flags.c_contiguous
-            and source.flags.aligned
-            and source.flags.writeable
+            and getattr(source.flags, "aligned", True)
+            and writable(source)
             and all(stride >= 0 for stride in source.strides)
         )
         if not copy and can_share:
-            return source.view(np.ndarray)
-    return np.array(source, dtype=dtype.numpy_dtype, copy=True, order="C", subok=False)
+            return backend.array(source, dtype=dtype.numpy_dtype, copy=False).view()
+        return transfer(source, backend.device, dtype.numpy_dtype, copy=True)
+    return backend.array(source, dtype=dtype.numpy_dtype, copy=True)
 
 
 class Tensor:
@@ -306,17 +315,18 @@ class Tensor:
     __array_ufunc__ = None
 
     __slots__ = (
+        "_backend", "_writable",
         "_data", "_dtype", "_requires_grad", "_grad", "_grad_fn", "_parents",
         "_is_leaf", "_retain_grad", "_version_counter", "_transform_context", "_index_context",
         "_operation_context", "_reduction_context",
     )
 
     def __init__(
-        self, data: object, dtype: object = None, requires_grad: builtins.bool = False
+        self, data: object, dtype: object = None, requires_grad: builtins.bool = False, *, device=None
     ):
         resolved_dtype = _resolve_dtype(data, dtype)
         _validate_requires_grad(resolved_dtype, requires_grad)
-        self._initialize(_make_array(data, resolved_dtype, copy=True), requires_grad)
+        self._initialize(_make_array(data, resolved_dtype, copy=True, device=device), requires_grad)
 
     def _initialize(
         self,
@@ -324,6 +334,10 @@ class Tensor:
         requires_grad: builtins.bool,
         version_counter: _VersionCounter | None = None,
     ) -> None:
+        if not is_array(array):
+            raise TypeError("Tensor storage must be a registered backend array.")
+        self._backend = get_backend(array)
+        self._writable = writable(array)
         self._dtype = from_numpy_dtype(array.dtype)
         _validate_requires_grad(self._dtype, requires_grad)
         self._data = array
@@ -349,6 +363,10 @@ class Tensor:
         instance = cls.__new__(cls)
         instance._initialize(array, requires_grad, version_counter)
         return instance
+
+    @property
+    def device(self) -> Device:
+        return self._backend.device
 
     @property
     def shape(self) -> tuple[builtins.int, ...]:
@@ -402,19 +420,22 @@ class Tensor:
         if gradient is None:
             if self.numel() != 1:
                 raise RuntimeError("An explicit gradient is required unless the output has exactly one element.")
-            seed = np.ones(self.shape, dtype=self.dtype.numpy_dtype)
+            seed = namespace(self).ones(self.shape, dtype=self.dtype.numpy_dtype)
         else:
-            supplied = Tensor(gradient, dtype=self.dtype)
+            ensure_same_device(self, gradient)
+            supplied = Tensor(gradient, dtype=self.dtype, device=self.device)
             if supplied.shape != self.shape:
                 raise RuntimeError(f"Gradient shape {supplied.shape} does not match output shape {self.shape}.")
             seed = supplied._data
         run_backward(self, seed, retain_graph)
 
+    @same_device
     def _accumulate_grad(self, gradient: np.ndarray) -> None:
+        xp = namespace(self)
         if self._grad is None:
-            self._grad = Tensor._from_array(np.array(gradient, dtype=self.dtype.numpy_dtype, copy=True), False)
+            self._grad = Tensor._from_array(xp.array(gradient, dtype=self.dtype.numpy_dtype, copy=True), False)
         else:
-            accumulated = np.add(self._grad._data, gradient)
+            accumulated = xp.add(self._grad._data, gradient)
             self._grad.copy_(accumulated)
 
     @property
@@ -441,13 +462,13 @@ class Tensor:
         return self._data.item()
 
     def tolist(self) -> list | builtins.bool | builtins.int | builtins.float:
-        return self._data.tolist()
+        return self.numpy().tolist()
 
     def numpy(self) -> np.ndarray:
-        return self._data.copy(order="C")
+        return self._backend.to_numpy(self._data)
 
     def clone(self) -> Tensor:
-        result = Tensor(self, requires_grad=self.requires_grad and is_grad_enabled())
+        result = Tensor(self, requires_grad=self.requires_grad and is_grad_enabled(), device=self.device)
         if result.requires_grad:
             result._is_leaf = False
             result._grad_fn = BackwardNode("clone", (self,), identity_backward, Context())
@@ -457,11 +478,34 @@ class Tensor:
         return self.clone()
 
     def detach(self) -> Tensor:
-        return Tensor._from_array(self._data.view(), False, self._version_counter)
+        result = Tensor._from_array(self._data.view(), False, self._version_counter)
+        result._writable = self._writable
+        return result
+
+    def to(self, device=None, dtype=None, *, copy=False) -> Tensor:
+        if type(copy) is not builtins.bool:
+            raise TypeError("copy must be a Python bool.")
+        target_device = self.device if device is None else Device(device)
+        target_dtype = self.dtype if dtype is None else normalize_dtype(dtype)
+        if target_device == self.device and target_dtype is self.dtype and not copy:
+            return self if is_grad_enabled() or not self.requires_grad else self.detach()
+        array = transfer(self._data, target_device, target_dtype.numpy_dtype, copy=True)
+        tracked = self.requires_grad and target_dtype.can_require_grad and is_grad_enabled()
+        result = Tensor._from_array(array, tracked)
+        if tracked:
+            result._is_leaf = False
+            result._grad_fn = BackwardNode("to", (self,), transfer_backward, Context(device=self.device, dtype=self.dtype.numpy_dtype))
+        return result
+
+    def cpu(self) -> Tensor:
+        return self.to("cpu")
+
+    def cuda(self, index=0) -> Tensor:
+        return self.to(Device("cuda", index))
 
     def astype(self, dtype: object) -> Tensor:
         target = normalize_dtype(dtype)
-        result = Tensor(self, dtype=target, requires_grad=self.requires_grad and target.can_require_grad and is_grad_enabled())
+        result = Tensor(self, dtype=target, requires_grad=self.requires_grad and target.can_require_grad and is_grad_enabled(), device=self.device)
         if result.requires_grad:
             result._is_leaf = False
             result._grad_fn = BackwardNode("astype", (self,), identity_backward, Context())
@@ -482,12 +526,12 @@ class Tensor:
     def bool(self) -> Tensor:
         return self.astype(bool_dtype)
 
-    @staticmethod
-    def _operand(value: object) -> Tensor:
+    def _operand(self, value: object) -> Tensor:
         if isinstance(value, Tensor):
+            ensure_same_device(self, value)
             return value
         if isinstance(value, (builtins.bool, builtins.int, builtins.float, np.generic)):
-            return Tensor(value)
+            return Tensor(value, device=self.device)
         raise TypeError(
             f"Operators require Tensor, Python scalar or NumPy scalar operands, got {type(value).__name__}. "
             "Convert sequences and ndarrays explicitly with tensor() or as_tensor()."
@@ -526,23 +570,27 @@ class Tensor:
             result._grad_fn = selection_node(operation, operands, compute_dtype, parameters)
         return result
 
+    @same_device
     def _binary_operation(self, other: object, operation: str, *, reverse: builtins.bool = False) -> Tensor:
+        xp = namespace(self)
         operand = self._operand(other)
         left, right = (operand, self) if reverse else (self, operand)
         comparison = operation in ("equal", "not_equal", "less", "less_equal", "greater", "greater_equal")
         promotion = "true_divide" if operation == "true_divide" else "arithmetic"
         compute_dtype = promote_types(left.dtype, right.dtype, operation=promotion)
         output_dtype = promote_types(left.dtype, right.dtype, operation="comparison") if comparison else compute_dtype
-        if operation == "power" and right.requires_grad and is_grad_enabled() and not np.all(left._data > 0):
+        if operation == "power" and right.requires_grad and is_grad_enabled() and not xp.all(left._data > 0):
             raise ValueError("Power requires a strictly positive base when the exponent requires_grad=True.")
         array = binary_forward(operation, left._data, right._data, compute_dtype, output_dtype)
         differentiable = not comparison and operation not in ("floor_divide", "remainder")
         return self._operation_result(array, operation, (left, right), compute_dtype, differentiable)
 
+    @same_device
     def _unary_operation(self, operation: str) -> Tensor:
         array = unary_forward(operation, self._data, self.dtype)
         return self._operation_result(array, operation, (self,), self.dtype, True)
 
+    @same_device
     def _elementwise(
         self, operation: str, parameter: object = None, approximation: object = None
     ) -> Tensor:
@@ -645,6 +693,7 @@ class Tensor:
     def minimum(self, other: object) -> Tensor:
         return self._binary_operation(other, "minimum")
 
+    @same_device
     def clamp(self, min: object = None, max: object = None) -> Tensor:
         if min is None and max is None:
             raise ValueError("clamp requires at least one of min or max.")
@@ -662,6 +711,7 @@ class Tensor:
         parameters = (("has_min", lower is not None), ("has_max", upper is not None))
         return self._operation_result(array, "clamp", (self,) + bounds, dtype, True, parameters)
 
+    @same_device
     def where(self, condition: object, other: object) -> Tensor:
         mask = self._operand(condition)
         if not mask.dtype.is_boolean:
@@ -671,8 +721,11 @@ class Tensor:
         array = where_forward(mask._data, self._data, right._data, dtype)
         return self._operation_result(array, "where", (mask, self, right), dtype, True)
 
+    @same_device
     def masked_fill(self, mask: object, value: object) -> Tensor:
-        condition = Tensor(mask) if isinstance(mask, np.ndarray) else self._operand(mask)
+        if is_array(mask):
+            ensure_same_device(self, mask)
+        condition = Tensor(mask, device=self.device) if is_array(mask) else self._operand(mask)
         if not condition.dtype.is_boolean:
             raise TypeError("masked_fill mask must have boolean dtype.")
         if broadcast_shapes(condition.shape, self.shape) != self.shape:
@@ -781,6 +834,7 @@ class Tensor:
             )
         return builtins.bool(self.item())
 
+    @same_device
     def _reduce(
         self, operation: str, dim: object, keepdim: builtins.bool, correction: object = None
     ) -> Tensor:
@@ -821,6 +875,7 @@ class Tensor:
     def logsumexp(self, dim: object = None, keepdim: builtins.bool = False) -> Tensor:
         return self._reduce("logsumexp", dim, keepdim)
 
+    @same_device
     def _normalized_exponential(self, operation: str, dim: object) -> Tensor:
         axis = normalize_axis(dim, self.ndim)
         dtype = self.dtype if self.dtype.is_floating_point else get_default_dtype()
@@ -876,6 +931,7 @@ class Tensor:
     def any(self, dim: object = None, keepdim: builtins.bool = False) -> Tensor:
         return self._reduce("any", dim, keepdim)
 
+    @same_device
     def _transform_result(
         self, array: np.ndarray, operation: str,
         permutation: tuple[builtins.int, ...] | None = None,
@@ -885,12 +941,15 @@ class Tensor:
         version = self._version_counter if _shares_storage(self._data, array) else None
         result = Tensor._from_array(array, self.requires_grad and is_grad_enabled(), version)
         result._is_leaf = not result.requires_grad
+        result._writable = (self._writable if version is not None else writable(array)) and operation != "expand"
         result._transform_context = _TransformContext(operation, self.shape, permutation, axes)
         if result.requires_grad:
             result._grad_fn = transform_node(operation, self, permutation, axes, **metadata)
         return result
 
+    @same_device
     def expand(self, *shape: object) -> Tensor:
+        xp = namespace(self)
         dimensions = normalize_shape(*shape, allow_inferred=True)
         if len(dimensions) < self.ndim:
             raise ValueError(f"Cannot expand shape {self.shape} to a lower-rank shape {dimensions}.")
@@ -905,23 +964,27 @@ class Tensor:
             if source != target and source != 1:
                 raise ValueError(f"Cannot expand non-singleton dimension from shape {self.shape} to {dimensions}.")
             resolved.append(target)
-        return self._transform_result(np.broadcast_to(self._data, tuple(resolved)), "expand")
+        return self._transform_result(xp.broadcast_to(self._data, tuple(resolved)), "expand")
 
     def broadcast_to(self, *shape: object) -> Tensor:
         return self.expand(*shape)
 
+    @same_device
     def repeat(self, *repeats: object) -> Tensor:
+        xp = namespace(self)
         counts = normalize_shape(*repeats)
         if len(counts) < self.ndim:
             raise ValueError(f"repeat requires at least {self.ndim} repetition counts.")
-        return self._transform_result(np.tile(self._data, counts), "repeat", repeats=counts)
+        return self._transform_result(xp.tile(self._data, counts), "repeat", repeats=counts)
 
+    @same_device
     def repeat_interleave(self, repeats: object, dim: object = None) -> Tensor:
+        xp = namespace(self)
         count = _integer_argument(repeats, "repeats", 0)
         if dim is None:
             return self.reshape(-1).repeat_interleave(count, 0)
         axis = normalize_axis(dim, self.ndim)
-        return self._transform_result(np.repeat(self._data, count, axis=axis), "repeat_interleave", repeats=count, axis=axis)
+        return self._transform_result(xp.repeat(self._data, count, axis=axis), "repeat_interleave", repeats=count, axis=axis)
 
     def split(self, split_size_or_sections: object, dim: object = 0) -> tuple[Tensor, ...]:
         axis = normalize_axis(dim, self.ndim)
@@ -947,26 +1010,31 @@ class Tensor:
         base, remainder = divmod(self.shape[axis], count)
         return self.split(tuple(base + (index < remainder) for index in range(count)), axis)
 
+    @same_device
     def tril(self, diagonal: object = 0) -> Tensor:
         if self.ndim < 2:
             raise ValueError("tril requires a Tensor with at least two dimensions.")
         offset = _integer_argument(diagonal, "diagonal")
-        return self._transform_result(np.tril(self._data, k=offset), "tril", diagonal=offset)
+        return self._transform_result(namespace(self).tril(self._data, k=offset), "tril", diagonal=offset)
 
+    @same_device
     def triu(self, diagonal: object = 0) -> Tensor:
         if self.ndim < 2:
             raise ValueError("triu requires a Tensor with at least two dimensions.")
         offset = _integer_argument(diagonal, "diagonal")
-        return self._transform_result(np.triu(self._data, k=offset), "triu", diagonal=offset)
+        return self._transform_result(namespace(self).triu(self._data, k=offset), "triu", diagonal=offset)
 
+    @same_device
     def reshape(self, *shape: object) -> Tensor:
         dimensions = normalize_reshape_shape(self.numel(), *shape)
         return self._transform_result(self._data.reshape(dimensions, order="C"), "reshape")
 
+    @same_device
     def view(self, *shape: object) -> Tensor:
+        xp = namespace(self)
         dimensions = normalize_reshape_shape(self.numel(), *shape)
         try:
-            array = np.reshape(self._data, dimensions, order="C", copy=False)
+            array = xp.reshape(self._data, dimensions, order="C", copy=False)
         except TypeError:
             array = self._data.reshape(dimensions, order="C")
         except ValueError:
@@ -975,6 +1043,7 @@ class Tensor:
             raise ValueError("view requires shared storage; use reshape or contiguous first.")
         return self._transform_result(array, "view")
 
+    @same_device
     def flatten(self, start_dim: object = 0, end_dim: object = -1) -> Tensor:
         start = normalize_axis(start_dim, max(self.ndim, 1))
         end = normalize_axis(end_dim, max(self.ndim, 1))
@@ -983,23 +1052,29 @@ class Tensor:
         dimensions = self.shape[:start] + (math.prod(self.shape[start:end + 1]),) + self.shape[end + 1:]
         return self._transform_result(self._data.reshape(dimensions, order="C"), "flatten")
 
+    @same_device
     def ravel(self) -> Tensor:
         return self._transform_result(self._data.ravel(order="C"), "ravel")
 
+    @same_device
     def squeeze(self, dim: object = None) -> Tensor:
+        xp = namespace(self)
         if dim is None:
             axes = tuple(axis for axis, size in enumerate(self.shape) if size == 1)
-            array = np.squeeze(self._data)
+            array = xp.squeeze(self._data)
         else:
             axis = normalize_axis(dim, max(self.ndim, 1))
             axes = (axis,) if self.ndim and self.shape[axis] == 1 else ()
-            array = np.squeeze(self._data, axis=axes) if axes else self._data.view()
+            array = xp.squeeze(self._data, axis=axes) if axes else self._data.view()
         return self._transform_result(array, "squeeze", axes=axes)
 
+    @same_device
     def unsqueeze(self, dim: object) -> Tensor:
+        xp = namespace(self)
         axis = normalize_axis(dim, self.ndim + 1)
-        return self._transform_result(np.expand_dims(self._data, axis=axis), "unsqueeze", axes=(axis,))
+        return self._transform_result(xp.expand_dims(self._data, axis=axis), "unsqueeze", axes=(axis,))
 
+    @same_device
     def transpose(self, dim0: object, dim1: object) -> Tensor:
         first, second = normalize_axis(dim0, self.ndim), normalize_axis(dim1, self.ndim)
         permutation = list(range(self.ndim))
@@ -1007,9 +1082,11 @@ class Tensor:
         axes = tuple(permutation)
         return self._transform_result(self._data.transpose(axes), "transpose", axes, axes=(first, second))
 
+    @same_device
     def swapaxes(self, dim0: object, dim1: object) -> Tensor:
         return self.transpose(dim0, dim1)
 
+    @same_device
     def moveaxis(self, source: object, destination: object) -> Tensor:
         sources = normalize_axes(source, self.ndim)
         destinations = normalize_axes(destination, self.ndim)
@@ -1021,6 +1098,7 @@ class Tensor:
         axes = tuple(permutation)
         return self._transform_result(self._data.transpose(axes), "moveaxis", axes)
 
+    @same_device
     def permute(self, *dims: object) -> Tensor:
         sequence = dims[0] if len(dims) == 1 and isinstance(dims[0], (list, tuple)) else dims
         axes = normalize_axes(sequence, self.ndim)
@@ -1035,6 +1113,7 @@ class Tensor:
     def is_contiguous(self) -> builtins.bool:
         return self._data.flags.c_contiguous
 
+    @same_device
     def contiguous(self) -> Tensor:
         if self.is_contiguous():
             if self.requires_grad and not is_grad_enabled():
@@ -1043,27 +1122,33 @@ class Tensor:
         return self._transform_result(self._data.copy(order="C"), "contiguous")
 
     def _indexed_data(self, index: tuple[object, ...]) -> np.ndarray | np.generic:
+        self._backend.validate_index(self._data, index)
         try:
             return self._data[index]
         except IndexError as error:
             raise IndexError(f"Invalid index for Tensor with shape {self.shape}: {error}") from None
 
     def _axis_index(self, dim: object, index: Tensor) -> tuple[np.ndarray, ...]:
+        ensure_same_device(self, index)
         axis = normalize_axis(dim, self.ndim)
         if not isinstance(index, Tensor) or not index.dtype.is_integer:
             raise TypeError("index must be a NamiTorch Tensor with integer dtype.")
         return axis_index_coordinates(self.shape, axis, _index_array(index._data))
 
+    @same_device
     def gather(self, dim: object, index: Tensor) -> Tensor:
+        xp = namespace(self)
         coordinates = self._axis_index(dim, index)
-        array = np.asarray(self._data[coordinates])
+        array = xp.asarray(self._data[coordinates])
         result = Tensor._from_array(array, self.requires_grad and is_grad_enabled())
         result._is_leaf = not result.requires_grad
         if result.requires_grad:
             result._grad_fn = indexing_node("gather", self, coordinates, True)
         return result
 
+    @same_device
     def scatter_add(self, dim: object, index: Tensor, src: Tensor) -> Tensor:
+        ensure_same_device(self, index, src)
         coordinates = self._axis_index(dim, index)
         if not isinstance(src, Tensor):
             raise TypeError("src must be a NamiTorch Tensor.")
@@ -1075,18 +1160,21 @@ class Tensor:
             result._grad_fn = scatter_add_node(self, src, coordinates)
         return result
 
+    @same_device
     def __getitem__(self, index: object) -> Tensor:
-        normalized = _normalize_index(index)
-        advanced = any(isinstance(component, (np.ndarray, builtins.bool)) for component in normalized)
+        xp = namespace(self)
+        normalized = _normalize_index(index, self.device)
+        advanced = any(is_array(component) or isinstance(component, builtins.bool) for component in normalized)
         selected = self._indexed_data(normalized)
-        if isinstance(selected, np.ndarray):
+        if is_array(selected):
             array = selected
         elif advanced:
-            array = np.array(selected, dtype=self.dtype.numpy_dtype)
+            array = xp.array(selected, dtype=self.dtype.numpy_dtype)
         else:
             array = _scalar_index_view(self._data, normalized)
         version = self._version_counter if _shares_storage(self._data, array) else None
         result = Tensor._from_array(array, self.requires_grad and is_grad_enabled(), version)
+        result._writable = self._writable if version is not None else writable(array)
         result._is_leaf = not result.requires_grad
         result._index_context = _IndexContext(self.shape, normalized, advanced, self._version)
         if result.requires_grad:
@@ -1096,7 +1184,7 @@ class Tensor:
     def _ensure_inplace_allowed(self) -> None:
         if self.requires_grad and is_grad_enabled():
             raise RuntimeError("In-place assignment is not allowed on a Tensor with requires_grad=True.")
-        if not self._data.flags.writeable:
+        if not self._writable or not writable(self._data):
             raise RuntimeError("Cannot assign to read-only Tensor storage.")
 
     def zero_(self) -> Tensor:
@@ -1104,7 +1192,7 @@ class Tensor:
 
     def fill_(self, value: object) -> Tensor:
         self._ensure_inplace_allowed()
-        scalar = value if isinstance(value, Tensor) else Tensor(value, dtype=self.dtype)
+        scalar = value if isinstance(value, Tensor) else Tensor(value, dtype=self.dtype, device=self.device)
         if scalar.ndim != 0:
             raise ValueError("fill_ requires a scalar value or a zero-dimensional Tensor.")
         return self.copy_(scalar)
@@ -1116,12 +1204,15 @@ class Tensor:
         self[...] = src
         return self
 
+    @same_device
     def __setitem__(self, index: object, value: object) -> None:
+        xp = namespace(self)
         self._ensure_inplace_allowed()
-        normalized = _normalize_index(index)
+        ensure_same_device(self, value)
+        normalized = _normalize_index(index, self.device)
         selected = self._indexed_data(normalized)
-        values = Tensor(value, dtype=self.dtype)._data
-        staged = np.empty(np.shape(selected), dtype=self.dtype.numpy_dtype)
+        values = Tensor(value, dtype=self.dtype, device=self.device)._data
+        staged = xp.empty(selected.shape, dtype=self.dtype.numpy_dtype)
         staged[...] = values
         self._data[normalized] = staged
         self._version_counter.increment()
@@ -1131,31 +1222,39 @@ class Tensor:
             raise TypeError("len() is not defined for a scalar Tensor.")
         return self.shape[0]
 
+    @same_device
     def __repr__(self) -> str:
         summarized = self.size > 1000
         display = self._data.reshape(-1) if summarized else self._data
+        if summarized:
+            display = namespace(self).concatenate((display[:3], display[-3:]))
+        display = self._backend.to_numpy(display)
         values = np.array2string(
-            display, separator=", ", threshold=1000, edgeitems=3, max_line_width=80,
+            display, separator=", ", threshold=5 if summarized else 1000, edgeitems=3 if not summarized else 2, max_line_width=80,
             precision=8, suppress_small=False, formatter={}, floatmode="maxprec_equal",
             sign="-", legacy=False,
         )
         shape = f", shape={self.shape}" if summarized or self.size == 0 else ""
-        return f"tensor({values}{shape}, dtype={self.dtype.name}, requires_grad={self.requires_grad})"
+        location = "" if self.device.type == "cpu" else f", device='{self.device}'"
+        return f"tensor({values}{shape}, dtype={self.dtype.name}{location}, requires_grad={self.requires_grad})"
 
 
-def tensor(data: object, dtype: object = None, requires_grad: builtins.bool = False) -> Tensor:
-    return Tensor(data, dtype=dtype, requires_grad=requires_grad)
+def tensor(data: object, dtype: object = None, requires_grad: builtins.bool = False, *, device=None) -> Tensor:
+    return Tensor(data, dtype=dtype, requires_grad=requires_grad, device=device)
 
 
-def as_tensor(data: object, dtype: object = None) -> Tensor:
+def as_tensor(data: object, dtype: object = None, *, device=None) -> Tensor:
     target = _resolve_dtype(data, dtype)
+    destination = get_backend(data).device if device is None and (is_array(data) or isinstance(data, Tensor)) else Device("cpu" if device is None else device)
     if isinstance(data, Tensor):
+        if data.device != destination:
+            return data.to(destination, target)
         if data.dtype is target:
             if data.requires_grad and not is_grad_enabled():
                 return data.detach()
             return data
         return data.astype(target)
-    return Tensor._from_array(_make_array(data, target, copy=False), False)
+    return Tensor._from_array(_make_array(data, target, copy=False, device=destination), False)
 
 
 __all__ = ["Tensor", "tensor", "as_tensor"]

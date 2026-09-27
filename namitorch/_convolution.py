@@ -1,15 +1,19 @@
 import numpy as np
 
+from .backends import namespace, same_device
 
+
+@same_device
 def im2col(input, kernel_size, stride, padding, dilation, output_spatial):
+    xp = namespace(input)
     batch, channels, _, _ = input.shape
     kh, kw = kernel_size
     sh, sw = stride
     ph, pw = padding
     dh, dw = dilation
     oh, ow = output_spatial
-    padded = np.pad(input, ((0, 0), (0, 0), (ph, ph), (pw, pw))) if ph or pw else input
-    columns = np.empty((batch, channels, kh, kw, oh, ow), dtype=input.dtype)
+    padded = xp.pad(input, ((0, 0), (0, 0), (ph, ph), (pw, pw))) if ph or pw else input
+    columns = xp.empty((batch, channels, kh, kw, oh, ow), dtype=input.dtype)
     for row in range(kh):
         for column in range(kw):
             start_h, start_w = row * dh, column * dw
@@ -17,13 +21,15 @@ def im2col(input, kernel_size, stride, padding, dilation, output_spatial):
     return columns
 
 
+@same_device
 def col2im(columns, input_shape, stride, padding, dilation):
+    xp = namespace(columns)
     batch, channels, height, width = input_shape
     _, _, kh, kw, oh, ow = columns.shape
     sh, sw = stride
     ph, pw = padding
     dh, dw = dilation
-    padded = np.zeros((batch, channels, height + 2 * ph, width + 2 * pw), dtype=columns.dtype)
+    padded = xp.zeros((batch, channels, height + 2 * ph, width + 2 * pw), dtype=columns.dtype)
     for row in range(kh):
         for column in range(kw):
             start_h, start_w = row * dh, column * dw
@@ -31,7 +37,9 @@ def col2im(columns, input_shape, stride, padding, dilation):
     return padded[:, :, ph:ph + height, pw:pw + width]
 
 
+@same_device
 def conv2d_forward(input, weight, bias, stride, padding, dilation, groups, output_spatial):
+    xp = namespace(input)
     batch, channels, _, _ = input.shape
     out_channels, _, kh, kw = weight.shape
     oh, ow = output_spatial
@@ -39,7 +47,7 @@ def conv2d_forward(input, weight, bias, stride, padding, dilation, groups, outpu
     columns = im2col(input, (kh, kw), stride, padding, dilation, output_spatial)
     columns = columns.reshape(batch, groups, inner, oh * ow)
     kernels = weight.reshape(groups, out_channels // groups, inner)
-    output = np.matmul(kernels, columns).reshape(batch, out_channels, oh, ow)
+    output = xp.matmul(kernels, columns).reshape(batch, out_channels, oh, ow)
     if bias is not None:
         output += bias.reshape(1, out_channels, 1, 1)
     return output

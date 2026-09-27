@@ -3,6 +3,8 @@ from copy import deepcopy
 
 import numpy as np
 
+from .backends import get_backend, namespace, same_device
+
 from .dtype import DType, get_default_dtype, int64, normalize_dtype
 from .tensor import Tensor, _validate_requires_grad
 from .utils import normalize_shape
@@ -102,17 +104,17 @@ def _floating_dtype(dtype: object, requires_grad: bool) -> DType:
     return target
 
 
-def rand(*shape: object, dtype: object = None, requires_grad: bool = False, generator: Generator | None = None) -> Tensor:
+def rand(*shape: object, dtype: object = None, requires_grad: bool = False, generator: Generator | None = None, device=None) -> Tensor:
     dimensions = normalize_shape(*shape)
     target = _floating_dtype(dtype, requires_grad)
-    array = _get_rng(generator).random(dimensions, dtype=target.numpy_dtype.type)
+    array = get_backend(device).random(_get_rng(generator), "random", dimensions, target.numpy_dtype.type)
     return Tensor._from_array(array, requires_grad)
 
 
-def randn(*shape: object, dtype: object = None, requires_grad: bool = False, generator: Generator | None = None) -> Tensor:
+def randn(*shape: object, dtype: object = None, requires_grad: bool = False, generator: Generator | None = None, device=None) -> Tensor:
     dimensions = normalize_shape(*shape)
     target = _floating_dtype(dtype, requires_grad)
-    array = _get_rng(generator).standard_normal(dimensions, dtype=target.numpy_dtype.type)
+    array = get_backend(device).random(_get_rng(generator), "standard_normal", dimensions, target.numpy_dtype.type)
     return Tensor._from_array(array, requires_grad)
 
 
@@ -127,7 +129,7 @@ def _integer_bound(value: object) -> int:
 
 def randint(
     low: object, high: object = None, size: object = (),
-    *, dtype: object = None, requires_grad: bool = False, generator: Generator | None = None,
+    *, dtype: object = None, requires_grad: bool = False, generator: Generator | None = None, device=None,
 ) -> Tensor:
     lower = 0 if high is None else _integer_bound(low)
     upper = _integer_bound(low if high is None else high)
@@ -141,7 +143,7 @@ def randint(
     limits = np.iinfo(target.numpy_dtype)
     if lower < limits.min or upper - 1 > limits.max:
         raise ValueError(f"randint bounds are outside the range of {target.name}.")
-    array = _get_rng(generator).integers(lower, upper, size=dimensions, dtype=target.numpy_dtype.type)
+    array = get_backend(device).random(_get_rng(generator), "integers", dimensions, target.numpy_dtype.type, low=lower, high=upper)
     return Tensor._from_array(array, False)
 
 
@@ -157,41 +159,43 @@ def _population_size(n: object) -> int:
     return int(value)
 
 
-def permutation(n: object, *, generator: Generator | None = None) -> Tensor:
+def permutation(n: object, *, generator: Generator | None = None, device=None) -> Tensor:
     count = _population_size(n)
-    array = _get_rng(generator).permutation(count).astype(np.int64, copy=False)
+    array = get_backend(device).random(_get_rng(generator), "permutation", count, np.int64)
     return Tensor._from_array(array, False)
 
 
-def choice(n: object, size: object = (), replace: bool = True, *, generator: Generator | None = None) -> Tensor:
+def choice(n: object, size: object = (), replace: bool = True, *, generator: Generator | None = None, device=None) -> Tensor:
     count = _population_size(n)
     dimensions = normalize_shape(size)
     if type(replace) is not bool:
         raise TypeError("replace must be a Python bool.")
-    array = _get_rng(generator).choice(count, size=dimensions, replace=replace)
-    return Tensor._from_array(np.asarray(array, dtype=np.int64), False)
+    array = get_backend(device).random(_get_rng(generator), "choice", dimensions, np.int64, n=count, replace=replace)
+    return Tensor._from_array(array, False)
 
 
+@same_device
 def categorical(probabilities: Tensor, *, generator: Generator | None = None) -> Tensor:
     _validate_generator(generator)
     if not isinstance(probabilities, Tensor) or not probabilities.dtype.is_floating_point:
         raise TypeError("categorical probabilities must be a floating Tensor.")
     if probabilities.ndim < 1 or probabilities.shape[-1] == 0:
         raise ValueError("categorical requires a nonempty final category dimension.")
-    values = np.asarray(probabilities._data, dtype=np.float64)
-    if np.any(~np.isfinite(values)) or np.any(values < 0):
+    xp = namespace(probabilities)
+    values = xp.asarray(probabilities._data, dtype=np.float64)
+    if xp.any(~xp.isfinite(values)) or xp.any(values < 0):
         raise ValueError("categorical probabilities must be finite and nonnegative.")
     maximum = values.max(axis=-1, keepdims=True)
-    if np.any(maximum == 0):
+    if xp.any(maximum == 0):
         raise ValueError("Each categorical distribution must have positive total weight.")
     scaled = values / maximum
     normalized = scaled / scaled.sum(axis=-1, keepdims=True)
-    cumulative = np.cumsum(normalized, axis=-1)
+    cumulative = xp.cumsum(normalized, axis=-1)
     cumulative /= cumulative[..., -1:]
     cumulative[..., -1] = 1.0
-    uniforms = _get_rng(generator).random(values.shape[:-1])
-    indices = np.sum(uniforms[..., None] >= cumulative, axis=-1, dtype=np.int64)
-    return Tensor._from_array(np.asarray(indices, dtype=np.int64), False)
+    uniforms = get_backend(probabilities).random(_get_rng(generator), "random", values.shape[:-1], np.float64)
+    indices = xp.sum(uniforms[..., None] >= cumulative, axis=-1, dtype=np.int64)
+    return Tensor._from_array(xp.asarray(indices, dtype=np.int64), False)
 
 
 __all__ = ["Generator", "manual_seed", "get_state", "set_state", "rand", "randn", "randint", "permutation", "choice", "categorical"]

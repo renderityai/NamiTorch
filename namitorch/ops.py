@@ -2,6 +2,8 @@ import builtins
 
 import numpy as np
 
+from .backends import ensure_same_device, get_backend, namespace
+
 from .autograd import cat_node, is_grad_enabled, stack_node
 from .dtype import result_type
 from .tensor import Tensor
@@ -25,12 +27,15 @@ def stack(tensors, dim: object = 0) -> Tensor:
         raise ValueError("stack requires at least one Tensor.")
     for operand in operands:
         _require_tensor(operand)
+    ensure_same_device(*operands)
+    xp = namespace(operands[0])
     shape = operands[0].shape
     if builtins.any(operand.shape != shape for operand in operands):
         raise ValueError(f"stack requires identical shapes, got {[operand.shape for operand in operands]}.")
     axis = normalize_axis(dim, len(shape) + 1)
     dtype = result_type(*(operand.dtype for operand in operands))
-    array = np.stack([operand._data.astype(dtype.numpy_dtype, copy=False) for operand in operands], axis=axis)
+    with get_backend(operands[0]).context():
+        array = xp.stack([operand._data.astype(dtype.numpy_dtype, copy=False) for operand in operands], axis=axis)
     requires_grad = is_grad_enabled() and builtins.any(operand.requires_grad for operand in operands)
     output = Tensor._from_array(array, requires_grad)
     output._is_leaf = not requires_grad
@@ -50,6 +55,8 @@ def cat(tensors, dim: object = 0) -> Tensor:
         raise ValueError("cat requires at least one Tensor.")
     for operand in operands:
         _require_tensor(operand)
+    ensure_same_device(*operands)
+    xp = namespace(operands[0])
     shape = operands[0].shape
     if not shape:
         raise ValueError("cat requires non-scalar Tensors; use stack for scalars.")
@@ -57,7 +64,8 @@ def cat(tensors, dim: object = 0) -> Tensor:
     if builtins.any(operand.ndim != len(shape) or operand.shape[:axis] + operand.shape[axis + 1:] != shape[:axis] + shape[axis + 1:] for operand in operands):
         raise ValueError(f"cat requires matching ranks and dimensions except dim={axis}, got {[operand.shape for operand in operands]}.")
     dtype = result_type(*(operand.dtype for operand in operands))
-    array = np.concatenate([operand._data.astype(dtype.numpy_dtype, copy=False) for operand in operands], axis=axis)
+    with get_backend(operands[0]).context():
+        array = xp.concatenate([operand._data.astype(dtype.numpy_dtype, copy=False) for operand in operands], axis=axis)
     requires_grad = is_grad_enabled() and builtins.any(operand.requires_grad for operand in operands)
     output = Tensor._from_array(array, requires_grad)
     output._is_leaf = not requires_grad
@@ -327,11 +335,11 @@ def softsign(input: Tensor) -> Tensor:
 
 
 def maximum(input: object, other: object) -> Tensor:
-    return Tensor._operand(input).maximum(other)
+    return _scalar_operand(input, other).maximum(other)
 
 
 def minimum(input: object, other: object) -> Tensor:
-    return Tensor._operand(input).minimum(other)
+    return _scalar_operand(input, other).minimum(other)
 
 
 def clamp(input: Tensor, min: object = None, max: object = None) -> Tensor:
@@ -339,7 +347,17 @@ def clamp(input: Tensor, min: object = None, max: object = None) -> Tensor:
 
 
 def where(condition: object, input: object, other: object) -> Tensor:
-    return Tensor._operand(input).where(condition, other)
+    return _scalar_operand(input, other, condition).where(condition, other)
+
+
+def _scalar_operand(value, *peers):
+    ensure_same_device(value, *peers)
+    if isinstance(value, Tensor):
+        return value
+    if not isinstance(value, (builtins.bool, builtins.int, builtins.float, np.generic)):
+        raise TypeError("Operands must be Tensors or numeric scalars.")
+    target = next((peer.device for peer in peers if isinstance(peer, Tensor)), None)
+    return Tensor(value, device=target)
 
 
 __all__ = [

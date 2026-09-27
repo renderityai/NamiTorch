@@ -42,7 +42,7 @@ def _encode(value, arrays, active, depth=0):
     if type(value) is float:
         return {"type": "float", "value": value.hex()}
     if isinstance(value, (Tensor, np.ndarray)):
-        array = value._data if isinstance(value, Tensor) else value
+        array = value.numpy() if isinstance(value, Tensor) else value
         if array.dtype.metadata is not None:
             raise SerializationError("Array dtypes with custom metadata are unsupported.")
         _dtype(array.dtype.str)

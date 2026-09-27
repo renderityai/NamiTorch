@@ -1,5 +1,7 @@
 import numpy as np
 
+from ..backends import namespace, same_device
+
 from ..tensor import Tensor
 from ._common import _FirstOrderOptimizer, _apply_update, _bool_option, _buffer, _gradient, _real_option, _scalar
 
@@ -21,7 +23,9 @@ class RMSprop(_FirstOrderOptimizer):
         _bool_option(prepared, "centered")
         return prepared
 
+    @same_device
     def _update_parameter(self, parameter: Tensor, gradient: Tensor, options: dict) -> None:
+        xp = namespace(parameter)
         grad = _gradient(parameter, gradient, options)
         state = self.state[id(parameter)]
         square_avg = _buffer(state, "square_avg", parameter)
@@ -32,8 +36,8 @@ class RMSprop(_FirstOrderOptimizer):
         if options["centered"]:
             grad_avg = _buffer(state, "grad_avg", parameter)
             grad_avg.copy_(alpha * grad_avg._data + complement * grad)
-            variance = np.maximum(variance - grad_avg._data * grad_avg._data, 0)
-        denominator = np.sqrt(variance) + _scalar(parameter, options["eps"], "eps")
+            variance = xp.maximum(variance - grad_avg._data * grad_avg._data, 0)
+        denominator = xp.sqrt(variance) + _scalar(parameter, options["eps"], "eps")
         update = grad / denominator
         if options["momentum"] != 0:
             buffer = _buffer(state, "momentum_buffer", parameter)

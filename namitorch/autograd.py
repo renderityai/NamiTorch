@@ -7,6 +7,8 @@ from typing import Callable
 
 import numpy as np
 
+from .backends import ensure_same_device, get_backend, is_array, namespace, transfer
+
 from ._backend import elementwise_derivative, normalized_exponential_forward
 from ._convolution import col2im, im2col
 from ._pooling import avg_pool2d_backward, max_pool2d_backward
@@ -46,8 +48,8 @@ class SavedArray:
     __slots__ = ("_array", "_counter", "_version")
 
     def __init__(self, array: np.ndarray, version_counter):
-        if not isinstance(array, np.ndarray):
-            raise TypeError("Saved backward values must be NumPy arrays.")
+        if not is_array(array):
+            raise TypeError("Saved backward values must be registered backend arrays.")
         self._array = array
         self._counter = version_counter
         self._version = version_counter.value
@@ -129,7 +131,8 @@ class BackwardNode:
 
     def apply(self, gradient: np.ndarray) -> tuple[np.ndarray | None, ...]:
         self.validate()
-        contributions = self._backward(self.context, gradient)
+        with get_backend(gradient).context():
+            contributions = self._backward(self.context, gradient)
         if not isinstance(contributions, tuple) or len(contributions) != len(self.parents):
             raise RuntimeError(f"Backward rule for {self.name} must return one contribution per parent.")
         return contributions
@@ -142,7 +145,8 @@ class BackwardNode:
 
 
 def sum_to_shape(gradient: np.ndarray, shape: tuple[int, ...]) -> np.ndarray:
-    gradient = np.asarray(gradient)
+    xp = namespace(gradient)
+    gradient = xp.asarray(gradient)
     leading = gradient.ndim - len(shape)
     if leading < 0 or any(
         expected != actual and expected != 1
@@ -166,6 +170,10 @@ def identity_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarra
     return (gradient,)
 
 
+def transfer_backward(context: Context, gradient) -> tuple:
+    return (transfer(gradient, context.metadata["device"], context.metadata["dtype"]),)
+
+
 def subtraction_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray, ...]:
     return tuple(
         sum_to_shape(gradient if index == 0 else -gradient, shape)
@@ -185,6 +193,7 @@ def _saved_operands(context: Context) -> dict[int, np.ndarray]:
 
 
 def conv2d_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray, ...]:
+    xp = namespace(gradient)
     metadata = context.metadata
     operands = _saved_operands(context)
     batch, channels, _, _ = metadata["input_shape"]
@@ -197,12 +206,12 @@ def conv2d_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray,
     for index in metadata["parent_indices"]:
         if index == 0:
             kernels = operands[1].reshape(groups, out_channels // groups, inner)
-            columns = np.matmul(kernels.swapaxes(-2, -1), upstream).reshape(batch, channels, kh, kw, oh, ow)
+            columns = xp.matmul(kernels.swapaxes(-2, -1), upstream).reshape(batch, channels, kh, kw, oh, ow)
             value = col2im(columns, metadata["input_shape"], metadata["stride"], metadata["padding"], metadata["dilation"])
         elif index == 1:
             columns = im2col(operands[0], (kh, kw), metadata["stride"], metadata["padding"], metadata["dilation"], (oh, ow))
             columns = columns.reshape(batch, groups, inner, oh * ow)
-            value = np.matmul(upstream, columns.swapaxes(-2, -1)).sum(axis=0, dtype=upstream.dtype).reshape(metadata["weight_shape"])
+            value = xp.matmul(upstream, columns.swapaxes(-2, -1)).sum(axis=0, dtype=upstream.dtype).reshape(metadata["weight_shape"])
         else:
             value = upstream.sum(axis=(0, 3), dtype=upstream.dtype).reshape(out_channels)
         contributions.append(value)
@@ -259,6 +268,7 @@ def division_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarra
 
 
 def power_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray, ...]:
+    xp = namespace(gradient)
     operands = _saved_operands(context)
     exponent = operands[1]
     contributions = []
@@ -267,40 +277,41 @@ def power_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray, 
             if 0 not in operands:
                 derivative = exponent
             else:
-                derivative = np.zeros_like(gradient)
-                np.power(operands[0], exponent - 1, out=derivative, where=exponent != 0)
+                derivative = xp.zeros_like(gradient)
+                xp.power(operands[0], exponent - 1, out=derivative, where=exponent != 0)
                 derivative *= exponent
             local = gradient * derivative
         else:
             base = operands[0]
-            local = gradient * np.power(base, exponent) * np.log(base)
+            local = gradient * xp.power(base, exponent) * xp.log(base)
         contributions.append(sum_to_shape(local, shape))
     return tuple(contributions)
 
 
 def matmul_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray, ...]:
+    xp = namespace(gradient)
     operands = _saved_operands(context)
     left_vector, right_vector = context.metadata["vector_operands"]
     if right_vector:
-        gradient = np.expand_dims(gradient, axis=-1)
+        gradient = xp.expand_dims(gradient, axis=-1)
     if left_vector:
-        gradient = np.expand_dims(gradient, axis=-2)
+        gradient = xp.expand_dims(gradient, axis=-2)
     contributions = []
     for index, shape in zip(context.metadata["parent_indices"], context.metadata["parent_shapes"]):
         if index == 0:
             right = operands[1]
             if right_vector:
-                right = np.expand_dims(right, axis=-1)
-            local = np.matmul(gradient, right.swapaxes(-1, -2))
+                right = xp.expand_dims(right, axis=-1)
+            local = xp.matmul(gradient, right.swapaxes(-1, -2))
             if left_vector:
-                local = np.squeeze(local, axis=-2)
+                local = xp.squeeze(local, axis=-2)
         else:
             left = operands[0]
             if left_vector:
-                left = np.expand_dims(left, axis=-2)
-            local = np.matmul(left.swapaxes(-1, -2), gradient)
+                left = xp.expand_dims(left, axis=-2)
+            local = xp.matmul(left.swapaxes(-1, -2), gradient)
             if right_vector:
-                local = np.squeeze(local, axis=-1)
+                local = xp.squeeze(local, axis=-1)
         contributions.append(sum_to_shape(local, shape))
     return tuple(contributions)
 
@@ -318,6 +329,7 @@ ARITHMETIC_BACKWARD_RULES = MappingProxyType({
 
 
 def arithmetic_node(operation: str, operands: tuple, compute_dtype) -> BackwardNode:
+    xp = namespace(operands[0])
     indices = tuple(index for index, operand in enumerate(operands) if operand.requires_grad)
     parents = tuple(operands[index] for index in indices)
     context = Context(parent_shapes=tuple(parent.shape for parent in parents))
@@ -331,7 +343,7 @@ def arithmetic_node(operation: str, operands: tuple, compute_dtype) -> BackwardN
         saved_indices = (0, 1) if 1 in indices else (1,)
     elif operation == "power":
         exponent = operands[1]._data
-        constant_derivative = indices == (0,) and np.all((exponent == 0) | (exponent == 1))
+        constant_derivative = indices == (0,) and xp.all((exponent == 0) | (exponent == 1))
         saved_indices = (1,) if constant_derivative else (0, 1)
     else:
         saved_indices = ()
@@ -349,11 +361,13 @@ def reshape_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray
 
 
 def squeeze_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray]:
-    return (np.expand_dims(gradient, axis=context.metadata["removed_axes"]),)
+    xp = namespace(gradient)
+    return (xp.expand_dims(gradient, axis=context.metadata["removed_axes"]),)
 
 
 def unsqueeze_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray]:
-    return (np.squeeze(gradient, axis=context.metadata["added_axis"]),)
+    xp = namespace(gradient)
+    return (xp.squeeze(gradient, axis=context.metadata["added_axis"]),)
 
 
 def transpose_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray]:
@@ -374,13 +388,14 @@ def expand_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray]
 
 
 def repeat_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray]:
+    xp = namespace(gradient)
     shape = context.metadata["original_shape"]
     repeats = context.metadata["repeats"]
     padded_shape = (1,) * (len(repeats) - len(shape)) + shape
     alternating = tuple(size for pair in zip(repeats, padded_shape) for size in pair)
     axes = tuple(range(0, len(alternating), 2))
     contribution = gradient.reshape(alternating).sum(axis=axes, dtype=gradient.dtype)
-    return (np.asarray(contribution).reshape(shape),)
+    return (xp.asarray(contribution).reshape(shape),)
 
 
 def repeat_interleave_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray]:
@@ -391,7 +406,8 @@ def repeat_interleave_backward(context: Context, gradient: np.ndarray) -> tuple[
 
 
 def triangular_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray]:
-    function = np.triu if context.metadata["upper"] else np.tril
+    xp = namespace(gradient)
+    function = xp.triu if context.metadata["upper"] else xp.tril
     return (function(gradient, k=context.metadata["diagonal"]),)
 
 
@@ -435,9 +451,10 @@ def transform_node(operation: str, parent, permutation: tuple[int, ...] | None, 
 
 
 def _broadcast_reduction_gradient(context: Context, gradient: np.ndarray) -> np.ndarray:
+    xp = namespace(gradient)
     if not context.metadata["keepdim"]:
-        gradient = np.expand_dims(gradient, axis=context.metadata["axes"])
-    return np.broadcast_to(gradient, context.metadata["original_shape"])
+        gradient = xp.expand_dims(gradient, axis=context.metadata["axes"])
+    return xp.broadcast_to(gradient, context.metadata["original_shape"])
 
 
 def sum_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray]:
@@ -445,29 +462,31 @@ def sum_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray]:
 
 
 def logsumexp_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray]:
+    xp = namespace(gradient)
     if not context.metadata["axes"]:
         return (gradient,)
     value, = context.saved_arrays
     weights = normalized_exponential_forward("softmax", value, context.metadata["axes"])
     expanded = _broadcast_reduction_gradient(context, gradient)
-    output = np.zeros_like(value)
+    output = xp.zeros_like(value)
     with np.errstate(under="ignore"):
-        np.multiply(expanded, weights, out=output, where=weights != 0)
+        xp.multiply(expanded, weights, out=output, where=weights != 0)
     return (output,)
 
 
 def normalized_exponential_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray]:
+    xp = namespace(gradient)
     output, = context.saved_arrays
     axis = context.metadata["axis"]
     with np.errstate(under="ignore"):
         if context.metadata["operation"] == "softmax":
-            dot = np.sum(gradient * output, axis=axis, keepdims=True, dtype=gradient.dtype)
+            dot = xp.sum(gradient * output, axis=axis, keepdims=True, dtype=gradient.dtype)
             contribution = output * (gradient - dot)
         else:
-            total = np.sum(gradient, axis=axis, keepdims=True, dtype=gradient.dtype)
-            contribution = gradient - np.exp(output) * total
-            np.copyto(contribution, 0, where=np.all(np.isneginf(output), axis=axis, keepdims=True))
-    return (np.asarray(contribution),)
+            total = xp.sum(gradient, axis=axis, keepdims=True, dtype=gradient.dtype)
+            contribution = gradient - xp.exp(output) * total
+            xp.copyto(contribution, 0, where=xp.all(xp.isneginf(output), axis=axis, keepdims=True))
+    return (xp.asarray(contribution),)
 
 
 def normalized_exponential_node(operation: str, parent, output, axis: int) -> BackwardNode:
@@ -477,52 +496,56 @@ def normalized_exponential_node(operation: str, parent, output, axis: int) -> Ba
 
 
 def mean_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray]:
-    count = np.asarray(context.metadata["count"], dtype=gradient.dtype)
-    return (np.asarray(_broadcast_reduction_gradient(context, gradient) / count),)
+    xp = namespace(gradient)
+    count = xp.asarray(context.metadata["count"], dtype=gradient.dtype)
+    return (xp.asarray(_broadcast_reduction_gradient(context, gradient) / count),)
 
 
 def product_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray]:
+    xp = namespace(gradient)
     data, = context.saved_arrays
     axes = context.metadata["axes"]
     zeros = data == 0
-    zero_count = np.sum(zeros, axis=axes, keepdims=True)
-    nonzero_product = np.prod(np.where(zeros, 1, data), axis=axes, keepdims=True, dtype=data.dtype)
-    derivative = np.zeros_like(data)
-    np.divide(nonzero_product, data, out=derivative, where=zero_count == 0)
-    np.copyto(derivative, np.broadcast_to(nonzero_product, data.shape), where=(zero_count == 1) & zeros)
-    return (np.asarray(_broadcast_reduction_gradient(context, gradient) * derivative),)
+    zero_count = xp.sum(zeros, axis=axes, keepdims=True)
+    nonzero_product = xp.prod(xp.where(zeros, 1, data), axis=axes, keepdims=True, dtype=data.dtype)
+    derivative = xp.zeros_like(data)
+    xp.divide(nonzero_product, data, out=derivative, where=zero_count == 0)
+    xp.copyto(derivative, xp.broadcast_to(nonzero_product, data.shape), where=(zero_count == 1) & zeros)
+    return (xp.asarray(_broadcast_reduction_gradient(context, gradient) * derivative),)
 
 
 def extremum_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray]:
+    xp = namespace(gradient)
     data, = context.saved_arrays
     axes = context.metadata["axes"]
-    function = np.min if context.metadata["operation"] in ("min", "amin") else np.max
+    function = xp.min if context.metadata["operation"] in ("min", "amin") else xp.max
     extremum = function(data, axis=axes, keepdims=True)
     mask = data == extremum
-    count = np.sum(mask, axis=axes, keepdims=True)
-    derivative = np.full_like(data, np.nan)
-    np.divide(mask, count, out=derivative, where=count != 0)
-    return (np.asarray(_broadcast_reduction_gradient(context, gradient) * derivative),)
+    count = xp.sum(mask, axis=axes, keepdims=True)
+    derivative = xp.full_like(data, np.nan)
+    xp.divide(mask, count, out=derivative, where=count != 0)
+    return (xp.asarray(_broadcast_reduction_gradient(context, gradient) * derivative),)
 
 
 def moment_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray]:
+    xp = namespace(gradient)
     data, = context.saved_arrays
     axes = context.metadata["axes"]
     count = context.metadata["count"]
     correction = context.metadata["correction"]
     if count - correction <= 0:
         raise ValueError(f"{context.metadata['operation']} requires N - correction > 0, got N={count} and correction={correction}.")
-    denominator = np.asarray(count - correction, dtype=data.dtype)
-    center = np.sum(data, axis=axes, keepdims=True, dtype=data.dtype) / np.asarray(count, dtype=data.dtype)
-    centered = np.asarray(data - center)
+    denominator = xp.asarray(count - correction, dtype=data.dtype)
+    center = xp.sum(data, axis=axes, keepdims=True, dtype=data.dtype) / xp.asarray(count, dtype=data.dtype)
+    centered = xp.asarray(data - center)
     if context.metadata["operation"] == "var":
         derivative = 2 * centered / denominator
     else:
-        variance = np.sum(centered * centered, axis=axes, keepdims=True, dtype=data.dtype) / denominator
-        deviation = np.sqrt(variance)
-        derivative = np.zeros_like(data)
-        np.divide(centered, denominator * deviation, out=derivative, where=deviation != 0)
-    return (np.asarray(_broadcast_reduction_gradient(context, gradient) * derivative),)
+        variance = xp.sum(centered * centered, axis=axes, keepdims=True, dtype=data.dtype) / denominator
+        deviation = xp.sqrt(variance)
+        derivative = xp.zeros_like(data)
+        xp.divide(centered, denominator * deviation, out=derivative, where=deviation != 0)
+    return (xp.asarray(_broadcast_reduction_gradient(context, gradient) * derivative),)
 
 
 REDUCTION_BACKWARD_RULES = MappingProxyType({
@@ -562,9 +585,10 @@ _OUTPUT_DERIVATIVES = frozenset(("exp", "sqrt", "rsqrt", "tanh", "sigmoid"))
 
 
 def elementwise_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray]:
+    xp = namespace(gradient)
     value, = context.saved_arrays
     derivative = elementwise_derivative(context.metadata["operation"], value, context.metadata)
-    return (np.asarray(gradient * derivative),)
+    return (xp.asarray(gradient * derivative),)
 
 
 def elementwise_node(operation: str, parent, output, parameters: tuple) -> BackwardNode:
@@ -575,40 +599,43 @@ def elementwise_node(operation: str, parent, output, parameters: tuple) -> Backw
 
 
 def binary_extremum_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray, ...]:
+    xp = namespace(gradient)
     operands = _saved_operands(context)
     left, right = operands[0], operands[1]
-    comparison = np.greater if context.metadata["operation"] == "maximum" else np.less
+    comparison = xp.greater if context.metadata["operation"] == "maximum" else xp.less
     equal = left == right
-    invalid = np.isnan(left) | np.isnan(right)
+    invalid = xp.isnan(left) | xp.isnan(right)
     contributions = []
     for index, shape in zip(context.metadata["parent_indices"], context.metadata["parent_shapes"]):
         first, second = (left, right) if index == 0 else (right, left)
-        local = np.where(comparison(first, second), gradient, np.where(equal, gradient * 0.5, 0))
-        contributions.append(sum_to_shape(np.where(invalid, np.nan, local), shape))
+        local = xp.where(comparison(first, second), gradient, xp.where(equal, gradient * 0.5, 0))
+        contributions.append(sum_to_shape(xp.where(invalid, np.nan, local), shape))
     return tuple(contributions)
 
 
 def where_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray, ...]:
+    xp = namespace(gradient)
     condition, = context.saved_arrays
     return tuple(
-        sum_to_shape(np.where(condition, gradient, 0) if index == 1 else np.where(condition, 0, gradient), shape)
+        sum_to_shape(xp.where(condition, gradient, 0) if index == 1 else xp.where(condition, 0, gradient), shape)
         for index, shape in zip(context.metadata["parent_indices"], context.metadata["parent_shapes"])
     )
 
 
 def clamp_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray, ...]:
+    xp = namespace(gradient)
     operands = _saved_operands(context)
     value = operands[0]
     lower_index = 1 if context.metadata["has_min"] else None
     upper_index = 1 + int(context.metadata["has_min"]) if context.metadata["has_max"] else None
-    interior = np.ones(value.shape, dtype=np.bool_)
-    invalid = np.isnan(value)
+    interior = xp.ones(value.shape, dtype=np.bool_)
+    invalid = xp.isnan(value)
     if lower_index is not None:
         interior &= value > operands[lower_index]
-        invalid |= np.isnan(operands[lower_index])
+        invalid |= xp.isnan(operands[lower_index])
     if upper_index is not None:
         interior &= value < operands[upper_index]
-        invalid |= np.isnan(operands[upper_index])
+        invalid |= xp.isnan(operands[upper_index])
     contributions = []
     for index, shape in zip(context.metadata["parent_indices"], context.metadata["parent_shapes"]):
         if index == 0:
@@ -617,11 +644,11 @@ def clamp_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray, 
             mask = value <= operands[index]
         else:
             mask = value >= operands[index]
-        local = np.where(mask, gradient, 0)
+        local = xp.where(mask, gradient, 0)
         if index != 0 and lower_index is not None and upper_index is not None:
             shared_boundary = (value == operands[lower_index]) & (value == operands[upper_index])
-            local = np.where(shared_boundary, gradient * 0.5, local)
-        local = np.where(invalid, np.nan, local)
+            local = xp.where(shared_boundary, gradient * 0.5, local)
+        local = xp.where(invalid, np.nan, local)
         contributions.append(sum_to_shape(local, shape))
     return tuple(contributions)
 
@@ -651,7 +678,8 @@ def selection_node(operation: str, operands: tuple, compute_dtype, parameters: t
 
 
 def stack_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray, ...]:
-    return tuple(np.asarray(np.take(gradient, index, axis=context.metadata["axis"])) for index in context.metadata["indices"])
+    xp = namespace(gradient)
+    return tuple(xp.asarray(xp.take(gradient, index, axis=context.metadata["axis"])) for index in context.metadata["indices"])
 
 
 def stack_node(operands: tuple, axis: int) -> BackwardNode:
@@ -682,10 +710,11 @@ def cat_node(operands: tuple, axis: int) -> BackwardNode:
 
 
 def indexing_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray]:
-    contribution = np.zeros(context.metadata["original_shape"], dtype=gradient.dtype)
+    xp = namespace(gradient)
+    contribution = xp.zeros(context.metadata["original_shape"], dtype=gradient.dtype)
     index = context.metadata["index"]
     if context.metadata["is_advanced"]:
-        np.add.at(contribution, index, gradient)
+        xp.add.at(contribution, index, gradient)
     else:
         contribution[index] += gradient
     return (contribution,)
@@ -697,6 +726,7 @@ def indexing_node(operation: str, parent, index: tuple, is_advanced: bool) -> Ba
 
 
 def embedding_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray]:
+    xp = namespace(gradient)
     shape = context.metadata["weight_shape"]
     indices = context.metadata["indices"].reshape(-1)
     values = gradient.reshape(-1, shape[1])
@@ -704,8 +734,8 @@ def embedding_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarr
     if padding is not None:
         selected = indices != padding
         indices, values = indices[selected], values[selected]
-    contribution = np.zeros(shape, dtype=gradient.dtype)
-    np.add.at(contribution, indices, values)
+    contribution = xp.zeros(shape, dtype=gradient.dtype)
+    xp.add.at(contribution, indices, values)
     return (contribution,)
 
 
@@ -715,8 +745,9 @@ def embedding_node(weight, indices: np.ndarray, padding_idx: int | None) -> Back
 
 
 def scatter_add_backward(context: Context, gradient: np.ndarray) -> tuple[np.ndarray, ...]:
+    xp = namespace(gradient)
     return tuple(
-        gradient if position == 0 else sum_to_shape(np.asarray(gradient[context.metadata["index"]]), shape)
+        gradient if position == 0 else sum_to_shape(xp.asarray(gradient[context.metadata["index"]]), shape)
         for position, shape in zip(context.metadata["parent_indices"], context.metadata["parent_shapes"])
     )
 
@@ -776,14 +807,15 @@ def run_backward(output, gradient: np.ndarray, retain_graph: bool) -> None:
             for parent, contribution in zip(node.parents, node.apply(incoming)):
                 if contribution is None:
                     continue
-                if not isinstance(contribution, np.ndarray) or contribution.shape != parent.shape:
+                if not is_array(contribution) or contribution.shape != parent.shape:
                     raise RuntimeError(f"Backward rule for {node.name} returned an invalid gradient for shape {parent.shape}.")
                 if contribution.dtype.kind != "f":
                     raise RuntimeError(f"Backward rule for {node.name} must return floating gradients.")
-                contribution = np.array(contribution, dtype=parent.dtype.numpy_dtype, copy=True)
+                ensure_same_device(parent, contribution)
+                contribution = namespace(parent).array(contribution, dtype=parent.dtype.numpy_dtype, copy=True)
                 identity = id(parent)
                 if identity in gradients:
-                    gradients[identity] += contribution
+                    namespace(parent).add(gradients[identity], contribution, out=gradients[identity])
                 else:
                     gradients[identity] = contribution
         for value, incoming in accumulated:

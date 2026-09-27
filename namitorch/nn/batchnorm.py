@@ -1,3 +1,4 @@
+from ..backends import writable
 from ..autograd import no_grad
 from ..creation import ones, zeros
 from ..dtype import get_default_dtype, int64, normalize_dtype
@@ -49,7 +50,7 @@ class _BatchNorm(Module):
             counter = self.num_batches_tracked
             if not isinstance(counter, Tensor) or counter.shape != () or counter.dtype is not int64:
                 raise ValueError("num_batches_tracked must be a scalar int64 Tensor.")
-            if not counter._data.flags.writeable:
+            if not writable(counter._data):
                 raise RuntimeError("Cannot update read-only num_batches_tracked.")
             count = counter.item()
             if not 0 <= count < 2 ** 63 - 1:

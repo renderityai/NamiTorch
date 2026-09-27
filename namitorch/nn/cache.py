@@ -1,5 +1,4 @@
-import numpy as np
-
+from ..backends import ensure_same_device, namespace, readonly, writable
 from ..autograd import is_grad_enabled
 from ..creation import empty
 from ..dtype import get_default_dtype, normalize_dtype
@@ -11,7 +10,7 @@ from . import functional as F
 class LayerKVCache:
     __slots__ = ("_batch_size", "_n_kv_heads", "_head_dim", "_max_seq_len", "_dtype", "_length", "_k", "_v")
 
-    def __init__(self, batch_size: int, n_kv_heads: int, head_dim: int, *, max_seq_len: int | None = None, dtype=None):
+    def __init__(self, batch_size: int, n_kv_heads: int, head_dim: int, *, max_seq_len: int | None = None, dtype=None, device=None):
         self._batch_size = F._integer(batch_size, "batch_size")
         if self._batch_size < 0:
             raise ValueError("batch_size must be nonnegative.")
@@ -23,8 +22,12 @@ class LayerKVCache:
             raise TypeError("LayerKVCache requires a floating dtype.")
         self._length = 0
         capacity = 0 if max_seq_len is None else self._max_seq_len
-        self._k = empty(self.batch_size, self.n_kv_heads, capacity, self.head_dim, dtype=self.dtype)
-        self._v = empty(self.batch_size, self.n_kv_heads, capacity, self.head_dim, dtype=self.dtype)
+        self._k = empty(self.batch_size, self.n_kv_heads, capacity, self.head_dim, dtype=self.dtype, device=device)
+        self._v = empty(self.batch_size, self.n_kv_heads, capacity, self.head_dim, dtype=self.dtype, device=device)
+
+    @property
+    def device(self):
+        return self._k.device
 
     @property
     def batch_size(self):
@@ -75,6 +78,7 @@ class LayerKVCache:
             raise ValueError(f"Cache capacity {self.max_seq_len} exceeded by requested length {self.length + append_length}.")
 
     def append(self, k: Tensor, v: Tensor):
+        ensure_same_device(self._k, self._v, k, v)
         if is_grad_enabled():
             raise RuntimeError("LayerKVCache.append is inference-only; use no_grad().")
         for name, tensor in (("key", k), ("value", v)):
@@ -93,9 +97,9 @@ class LayerKVCache:
             new_v = cat((self.v, v.detach()), dim=2)
             self._k, self._v = new_k, new_v
         else:
-            if not self._k._data.flags.writeable or not self._v._data.flags.writeable:
+            if not writable(self._k._data) or not writable(self._v._data):
                 raise RuntimeError("Cache storage must be writable.")
-            if any(np.shares_memory(source._data, target._data) for source in (k, v) for target in (self._k, self._v)):
+            if any(namespace(source).shares_memory(source._data, target._data) for source in (k, v) for target in (self._k, self._v)):
                 k, v = k.detach().clone(), v.detach().clone()
             self._k[:, :, self.length:end].copy_(k)
             self._v[:, :, self.length:end].copy_(v)
@@ -106,8 +110,10 @@ class LayerKVCache:
         result = []
         for tensor in (self._k, self._v):
             array = tensor._data[:, :, :self.length].view()
-            array.flags.writeable = False
-            result.append(Tensor._from_array(array, False, tensor._version_counter))
+            readonly(array)
+            view = Tensor._from_array(array, False, tensor._version_counter)
+            view._writable = False
+            result.append(view)
         return result[0], result[1]
 
     def reset(self) -> None:

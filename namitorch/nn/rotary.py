@@ -1,5 +1,7 @@
 import numpy as np
 
+from ..backends import namespace
+
 from ..ops import cat, stack
 from ..tensor import Tensor
 from . import functional as F
@@ -30,6 +32,7 @@ class RotaryEmbedding(Module):
         self._ensure_cache(initial_cache_length)
 
     def _ensure_cache(self, required_length: int) -> None:
+        xp = namespace(self.inv_freq)
         if required_length > self.max_seq_len:
             raise ValueError(f"RoPE positions require length {required_length}, exceeding max_seq_len={self.max_seq_len}.")
         current_length = self.cos_cached.shape[0]
@@ -37,11 +40,11 @@ class RotaryEmbedding(Module):
             return
         length = min(self.max_seq_len, max(required_length, 2 * current_length))
         with np.errstate(over="ignore", invalid="ignore"):
-            angles = np.arange(length, dtype=np.float64)[:, None] * self.inv_freq._data[None, :]
-        if not np.all(np.isfinite(angles)):
+            angles = xp.arange(length, dtype=np.float64)[:, None] * self.inv_freq._data[None, :]
+        if not xp.all(xp.isfinite(angles)):
             raise ValueError("Requested positions produce nonfinite rotary angles.")
-        self.cos_cached = Tensor(np.cos(angles))
-        self.sin_cached = Tensor(np.sin(angles))
+        self.cos_cached = Tensor._from_array(xp.cos(angles), False)
+        self.sin_cached = Tensor._from_array(xp.sin(angles), False)
 
     def forward(self, input: Tensor, offset: int = 0) -> Tensor:
         if not isinstance(input, Tensor):

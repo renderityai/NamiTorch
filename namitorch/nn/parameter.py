@@ -4,8 +4,8 @@ from ..tensor import Tensor
 class Parameter(Tensor):
     __slots__ = ()
 
-    def __init__(self, data: object, requires_grad: bool | None = None, *, dtype: object = None):
-        super().__init__(data, dtype=dtype)
+    def __init__(self, data: object, requires_grad: bool | None = None, *, dtype: object = None, device=None):
+        super().__init__(data, dtype=dtype, device=data.device if device is None and isinstance(data, Tensor) else device)
         self.requires_grad = self.dtype.can_require_grad if requires_grad is None else requires_grad
 
     def __repr__(self) -> str:

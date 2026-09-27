@@ -3,18 +3,19 @@ from collections import defaultdict
 import numpy as np
 
 from ..autograd import no_grad
+from ..backends import ensure_same_device, is_array
 from ..dtype import from_numpy_dtype
 from ..nn.parameter import Parameter
 from ..tensor import Tensor
 
 
 def _copy_value(value, path: str, parameter_shape: tuple[int, ...] | None = None, active: set[int] | None = None):
-    if isinstance(value, (Tensor, np.ndarray)):
+    if isinstance(value, Tensor) or is_array(value):
         shape = value.shape
         if parameter_shape is not None and shape not in ((), parameter_shape):
             raise ValueError(f"{path} has shape {shape}; expected scalar state or parameter shape {parameter_shape}.")
         if isinstance(value, Tensor):
-            return Tensor(value)
+            return Tensor(value, device=value.device)
         from_numpy_dtype(value.dtype)
         return value.copy()
     if isinstance(value, np.generic):
@@ -147,6 +148,7 @@ class Optimizer:
                 gradient = parameter.grad
                 if not isinstance(gradient, Tensor):
                     raise TypeError("Parameter gradients must be NamiTorch Tensors.")
+                ensure_same_device(parameter, gradient)
                 if gradient.shape != parameter.shape:
                     raise ValueError(f"Gradient shape {gradient.shape} does not match parameter shape {parameter.shape}.")
                 if gradient.dtype is not parameter.dtype:

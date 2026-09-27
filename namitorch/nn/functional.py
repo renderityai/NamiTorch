@@ -4,6 +4,8 @@ from numbers import Real
 
 import numpy as np
 
+from ..backends import get_backend, namespace, readonly, same_device, writable
+
 from .._convolution import conv2d_forward
 from .._pooling import avg_pool2d_forward, max_pool2d_forward
 from ..autograd import conv2d_node, embedding_node, is_grad_enabled, no_grad, pooling_node
@@ -38,6 +40,7 @@ def _padding_index(padding_idx: object, num_embeddings: int) -> int | None:
     return index % num_embeddings
 
 
+@same_device
 def linear(input: Tensor, weight: Tensor, bias: Tensor | None = None) -> Tensor:
     if not isinstance(input, Tensor) or not isinstance(weight, Tensor):
         raise TypeError("linear input and weight must be NamiTorch Tensors.")
@@ -94,6 +97,7 @@ def _convolution_arguments(input, weight, bias, stride, padding, dilation, group
     return stride, padding, dilation, groups, output_spatial
 
 
+@same_device
 def conv2d(input: Tensor, weight: Tensor, bias: Tensor | None = None, stride=1, padding=0, dilation=1, groups=1) -> Tensor:
     stride, padding, dilation, groups, output_spatial = _convolution_arguments(input, weight, bias, stride, padding, dilation, groups, 2)
     operands = tuple(value for value in (input, weight, bias) if value is not None)
@@ -110,6 +114,7 @@ def conv2d(input: Tensor, weight: Tensor, bias: Tensor | None = None, stride=1, 
     return output
 
 
+@same_device
 def conv1d(input: Tensor, weight: Tensor, bias: Tensor | None = None, stride=1, padding=0, dilation=1, groups=1) -> Tensor:
     stride, padding, dilation, groups, _ = _convolution_arguments(input, weight, bias, stride, padding, dilation, groups, 1)
     return conv2d(
@@ -140,6 +145,7 @@ def _pool_arguments(input, kernel_size, stride, padding, dilation, dimensions):
     return kernel, stride, padding, dilation, spatial
 
 
+@same_device
 def max_pool2d(input: Tensor, kernel_size, stride=None, padding=0, dilation=1) -> Tensor:
     kernel, stride, padding, dilation, spatial = _pool_arguments(input, kernel_size, stride, padding, dilation, 2)
     array, indices = max_pool2d_forward(input._data, kernel, stride, padding, dilation, spatial)
@@ -150,6 +156,7 @@ def max_pool2d(input: Tensor, kernel_size, stride=None, padding=0, dilation=1) -
     return output
 
 
+@same_device
 def avg_pool2d(input: Tensor, kernel_size, stride=None, padding=0, count_include_pad=True) -> Tensor:
     if type(count_include_pad) is not bool:
         raise TypeError("count_include_pad must be a Python bool.")
@@ -162,17 +169,21 @@ def avg_pool2d(input: Tensor, kernel_size, stride=None, padding=0, count_include
     return output
 
 
+@same_device
 def max_pool1d(input: Tensor, kernel_size, stride=None, padding=0, dilation=1) -> Tensor:
     kernel, stride, padding, dilation, _ = _pool_arguments(input, kernel_size, stride, padding, dilation, 1)
     return max_pool2d(input.unsqueeze(-2), (1, kernel[0]), (1, stride[0]), (0, padding[0]), (1, dilation[0])).squeeze(-2)
 
 
+@same_device
 def avg_pool1d(input: Tensor, kernel_size, stride=None, padding=0, count_include_pad=True) -> Tensor:
     kernel, stride, padding, _, _ = _pool_arguments(input, kernel_size, stride, padding, 1, 1)
     return avg_pool2d(input.unsqueeze(-2), (1, kernel[0]), (1, stride[0]), (0, padding[0]), count_include_pad).squeeze(-2)
 
 
+@same_device
 def embedding(input: Tensor, weight: Tensor, padding_idx: object = None) -> Tensor:
+    xp = namespace(input)
     if not isinstance(input, Tensor) or not input.dtype.is_integer:
         raise TypeError("embedding input must be an integer NamiTorch Tensor.")
     if not isinstance(weight, Tensor):
@@ -180,11 +191,11 @@ def embedding(input: Tensor, weight: Tensor, padding_idx: object = None) -> Tens
     if weight.ndim != 2 or any(size == 0 for size in weight.shape):
         raise ValueError(f"embedding weight must have rank 2 with positive dimensions, got shape {weight.shape}.")
     padding = _padding_index(padding_idx, weight.shape[0])
-    indices = input.numpy()
-    if np.any(indices < 0) or np.any(indices >= weight.shape[0]):
+    indices = input._data.copy()
+    if xp.any(indices < 0) or xp.any(indices >= weight.shape[0]):
         raise IndexError(f"embedding indices must be in [0, {weight.shape[0]}).")
-    indices.flags.writeable = False
-    output = Tensor._from_array(np.asarray(weight._data[indices]), weight.requires_grad and is_grad_enabled())
+    readonly(indices)
+    output = Tensor._from_array(xp.asarray(weight._data[indices]), weight.requires_grad and is_grad_enabled())
     output._is_leaf = not output.requires_grad
     if output.requires_grad:
         output._grad_fn = embedding_node(weight, indices, padding)
@@ -231,57 +242,68 @@ def _gelu_approximation(approximation: str) -> str:
     return approximation
 
 
+@same_device
 def relu(input: Tensor, inplace: bool = False) -> Tensor:
     _validate_inplace(inplace)
     return _require_input(input).relu()
 
 
+@same_device
 def leaky_relu(input: Tensor, negative_slope: object = 0.01, inplace: bool = False) -> Tensor:
     _validate_inplace(inplace)
     return _require_input(input).leaky_relu(negative_slope)
 
 
+@same_device
 def elu(input: Tensor, alpha: object = 1.0, inplace: bool = False) -> Tensor:
     _validate_inplace(inplace)
     return _require_input(input).elu(alpha)
 
 
+@same_device
 def gelu(input: Tensor, approximation: str = "exact") -> Tensor:
     return _require_input(input).gelu(approximation)
 
 
+@same_device
 def silu(input: Tensor, inplace: bool = False) -> Tensor:
     _validate_inplace(inplace)
     return _require_input(input).silu()
 
 
+@same_device
 def sigmoid(input: Tensor) -> Tensor:
     return _require_input(input).sigmoid()
 
 
+@same_device
 def tanh(input: Tensor) -> Tensor:
     return _require_input(input).tanh()
 
 
+@same_device
 def softplus(input: Tensor) -> Tensor:
     return _require_input(input).softplus()
 
 
+@same_device
 def softmax(input: Tensor, dim: object) -> Tensor:
     return _require_input(input).softmax(dim)
 
 
+@same_device
 def log_softmax(input: Tensor, dim: object) -> Tensor:
     return _require_input(input).log_softmax(dim)
 
 
 def _attention_inputs(query, key, value):
+    xp = namespace(query)
     for name, operand in (("query", query), ("key", key), ("value", value)):
         if not isinstance(operand, Tensor) or not operand.dtype.is_floating_point:
             raise TypeError(f"Attention {name} must be a floating NamiTorch Tensor.")
         if operand.ndim != 4:
             raise ValueError(f"Attention {name} must have rank 4, got shape {operand.shape}.")
-        if not np.all(np.isfinite(operand._data)):
+        if not xp.all(xp.isfinite(operand._data)):
             raise ValueError(f"Attention {name} must contain finite values.")
     batch, heads, query_length, head_dim = query.shape
     if key.shape[:2] != (batch, heads) or value.shape[:2] != (batch, heads):
@@ -296,23 +318,26 @@ def _attention_inputs(query, key, value):
 
 
 def _attention_mask(attn_mask, score_shape):
+    xp = namespace(attn_mask)
     if attn_mask is None:
         return None
     if not isinstance(attn_mask, Tensor) or not (attn_mask.dtype.is_boolean or attn_mask.dtype.is_floating_point):
         raise TypeError("attn_mask must be a boolean or floating NamiTorch Tensor, or None.")
     if broadcast_shapes(attn_mask.shape, score_shape) != score_shape:
         raise ValueError(f"attn_mask shape {attn_mask.shape} must broadcast to attention scores {score_shape} without expanding them.")
-    if attn_mask.dtype.is_floating_point and np.any(np.isnan(attn_mask._data) | np.isposinf(attn_mask._data)):
+    if attn_mask.dtype.is_floating_point and xp.any(xp.isnan(attn_mask._data) | xp.isposinf(attn_mask._data)):
         raise ValueError("Additive attn_mask may contain finite values or -inf, but not NaN or +inf.")
     return attn_mask
 
 
+@same_device
 def scaled_dot_product_attention(
     query: Tensor, key: Tensor, value: Tensor, attn_mask: Tensor | None = None,
     dropout_p: float = 0.0, is_causal: bool = False, *, scale: float | None = None,
     query_position_offset: int = 0, training: bool = True, need_weights: bool = False,
     generator: Generator | None = None,
 ) -> Tensor | tuple[Tensor, Tensor]:
+    xp = namespace(query)
     batch, heads, query_length, key_length, head_dim = _attention_inputs(query, key, value)
     for name, flag in (("is_causal", is_causal), ("training", training), ("need_weights", need_weights)):
         if type(flag) is not bool:
@@ -328,31 +353,31 @@ def scaled_dot_product_attention(
     if abs(scale_value) > float(np.finfo(dtype.numpy_dtype).max):
         raise ValueError(f"Attention scale must be representable in {dtype.name}.")
     with np.errstate(under="ignore"):
-        factor = Tensor(scale_value, dtype=dtype)
+        factor = Tensor(scale_value, dtype=dtype, device=query.device)
     if scale_value != 0 and factor.item() == 0:
         raise ValueError(f"Nonzero attention scale must remain nonzero in {dtype.name}.")
     with np.errstate(over="ignore", invalid="ignore", under="ignore"):
         scores = (query @ key.transpose(-2, -1)) * factor
-    if not np.all(np.isfinite(scores._data)):
+    if not xp.all(xp.isfinite(scores._data)):
         raise ValueError("Attention scores must be finite before masking; input magnitudes or scale exceed the compute dtype range.")
     allowed = None
     if is_causal:
-        key_positions = np.arange(key_length) - min(offset, key_length)
-        allowed = key_positions[None, :] <= np.arange(query_length)[:, None]
+        key_positions = xp.arange(key_length) - min(offset, key_length)
+        allowed = key_positions[None, :] <= xp.arange(query_length)[:, None]
     if mask is not None:
         if mask.dtype.is_boolean:
-            allowed = mask._data if allowed is None else np.logical_and(allowed, mask._data)
+            allowed = mask._data if allowed is None else xp.logical_and(allowed, mask._data)
         else:
             with np.errstate(over="ignore", invalid="ignore", under="ignore"):
                 scores = scores + mask
     if allowed is not None:
-        blocked = Tensor._from_array(np.asarray(np.logical_not(allowed)), False)
+        blocked = Tensor._from_array(xp.asarray(xp.logical_not(allowed)), False)
         scores = scores.masked_fill(blocked, -float("inf"))
-    if np.any(np.isnan(scores._data) | np.isposinf(scores._data)):
+    if xp.any(xp.isnan(scores._data) | xp.isposinf(scores._data)):
         raise ValueError("Masked attention scores must be finite or -inf.")
-    empty_rows = ~np.any(np.isfinite(scores._data), axis=-1)
-    if np.any(empty_rows):
-        row = tuple(int(index) for index in np.argwhere(empty_rows)[0])
+    empty_rows = ~xp.any(xp.isfinite(scores._data), axis=-1)
+    if xp.any(empty_rows):
+        row = tuple(int(index) for index in xp.argwhere(empty_rows)[0])
         raise ValueError(f"Attention row {row} has no allowed keys.")
     weights = dropout(scores.softmax(-1), p=probability, training=training, generator=generator)
     output = weights @ value
@@ -390,13 +415,14 @@ def _normalization_arguments(input, normalized_shape, weight, bias, eps):
     if epsilon > float(np.finfo(input.dtype.numpy_dtype).max):
         raise ValueError(f"eps must be finite and positive in {input.dtype.name}.")
     with np.errstate(under="ignore"):
-        constant = Tensor(epsilon, dtype=input.dtype)
+        constant = Tensor(epsilon, dtype=input.dtype, device=input.device)
     if constant.item() == 0:
         raise ValueError(f"eps must remain positive in {input.dtype.name}.")
     axes = tuple(range(input.ndim - len(shape), input.ndim))
     return axes, constant
 
 
+@same_device
 def layer_norm(
     input: Tensor, normalized_shape: object, weight: Tensor | None = None,
     bias: Tensor | None = None, eps: float = 1e-5,
@@ -410,6 +436,7 @@ def layer_norm(
     return output if bias is None else output + bias
 
 
+@same_device
 def rms_norm(
     input: Tensor, normalized_shape: object, weight: Tensor | None = None, eps: float = 1e-5,
 ) -> Tensor:
@@ -426,7 +453,9 @@ def _batch_norm_momentum(momentum):
     return value
 
 
+@same_device
 def batch_norm(input: Tensor, running_mean=None, running_var=None, weight=None, bias=None, training=False, momentum=0.1, eps=1e-5) -> Tensor:
+    xp = namespace(input)
     _require_input(input)
     if not input.dtype.is_floating_point:
         raise TypeError("BatchNorm input must have a floating dtype.")
@@ -450,9 +479,9 @@ def batch_norm(input: Tensor, running_mean=None, running_var=None, weight=None, 
     if running_mean is not None:
         if running_mean.requires_grad or running_var.requires_grad:
             raise ValueError("BatchNorm running statistics must not require gradients.")
-        if np.shares_memory(running_mean._data, running_var._data):
+        if xp.shares_memory(running_mean._data, running_var._data):
             raise ValueError("BatchNorm running_mean and running_var must have independent storage.")
-        if training and (not running_mean._data.flags.writeable or not running_var._data.flags.writeable):
+        if training and (not writable(running_mean._data) or not writable(running_var._data)):
             raise RuntimeError("Cannot update read-only BatchNorm running statistics.")
     axes = (0, *range(2, input.ndim))
     shape = (1, channels, *((1,) * (input.ndim - 2)))
@@ -471,8 +500,8 @@ def batch_norm(input: Tensor, running_mean=None, running_var=None, weight=None, 
     if bias is not None:
         output = output + bias.reshape(shape)
     if training and running_mean is not None:
-        mean_values = mean.numpy().reshape(channels).astype(running_mean.dtype.numpy_dtype)
-        variance_values = variance.numpy().reshape(channels).astype(running_var.dtype.numpy_dtype)
+        mean_values = mean._data.reshape(channels).astype(running_mean.dtype.numpy_dtype)
+        variance_values = variance._data.reshape(channels).astype(running_var.dtype.numpy_dtype)
         if count > 1:
             variance_values *= count / (count - 1)
         next_mean = (1 - momentum) * running_mean._data + momentum * mean_values
@@ -483,7 +512,9 @@ def batch_norm(input: Tensor, running_mean=None, running_var=None, weight=None, 
     return output
 
 
+@same_device
 def dropout(input: Tensor, p: object = 0.5, training: bool = True, inplace: bool = False, *, generator: Generator | None = None) -> Tensor:
+    xp = namespace(input)
     _require_input(input)
     _validate_inplace(inplace)
     probability = _dropout_probability(p)
@@ -495,8 +526,8 @@ def dropout(input: Tensor, p: object = 0.5, training: bool = True, inplace: bool
     if not input.dtype.is_floating_point:
         raise TypeError("Training dropout requires a floating Tensor input.")
     rng = _get_rng() if generator is None else _get_rng(generator)
-    mask = Tensor._from_array(np.asarray(rng.random(input.shape) >= probability, dtype=input.dtype.numpy_dtype), False)
-    denominator = Tensor(1 - probability, dtype=input.dtype)
+    mask = Tensor._from_array(xp.asarray(get_backend(input).random(rng, "random", input.shape, None) >= probability, dtype=input.dtype.numpy_dtype), False)
+    denominator = Tensor(1 - probability, dtype=input.dtype, device=input.device)
     return input * mask / denominator
 
 
@@ -517,7 +548,7 @@ def _reduce_loss(loss: Tensor, reduction: str, mean_denominator: Tensor | None =
     if mean_denominator is not None:
         return loss.sum() / mean_denominator
     if loss.numel() == 0:
-        return loss.sum() * Tensor(float("nan"), dtype=loss.dtype)
+        return loss.sum() * Tensor(float("nan"), dtype=loss.dtype, device=loss.device)
     return loss.mean()
 
 
@@ -548,22 +579,25 @@ def _loss_constant(value: float, name: str, input: Tensor) -> Tensor:
     if value > float(np.finfo(input.dtype.numpy_dtype).max):
         raise ValueError(f"{name} must be representable in {input.dtype.name}.")
     with np.errstate(under="ignore"):
-        constant = Tensor(value, dtype=input.dtype)
+        constant = Tensor(value, dtype=input.dtype, device=input.device)
     if value > 0 and constant.item() == 0:
         raise ValueError(f"{name} must remain positive in {input.dtype.name}.")
     return constant
 
 
+@same_device
 def mse_loss(input: Tensor, target: Tensor, reduction: str = "mean") -> Tensor:
     _loss_inputs(input, target, reduction)
     return _reduce_loss((input - target).square(), reduction)
 
 
+@same_device
 def l1_loss(input: Tensor, target: Tensor, reduction: str = "mean") -> Tensor:
     _loss_inputs(input, target, reduction)
     return _reduce_loss((input - target).abs(), reduction)
 
 
+@same_device
 def smooth_l1_loss(input: Tensor, target: Tensor, reduction: str = "mean", beta: float = 1.0) -> Tensor:
     _loss_inputs(input, target, reduction)
     beta = _loss_scale(beta, "beta", allow_zero=True)
@@ -576,6 +610,7 @@ def smooth_l1_loss(input: Tensor, target: Tensor, reduction: str = "mean", beta:
     return _reduce_loss(loss, reduction)
 
 
+@same_device
 def huber_loss(input: Tensor, target: Tensor, reduction: str = "mean", delta: float = 1.0) -> Tensor:
     _loss_inputs(input, target, reduction)
     delta = _loss_scale(delta, "delta")
@@ -587,17 +622,19 @@ def huber_loss(input: Tensor, target: Tensor, reduction: str = "mean", delta: fl
 
 
 def _loss_weight(weight: Tensor | None, name: str) -> None:
+    xp = namespace(weight)
     if weight is None:
         return
     if not isinstance(weight, Tensor):
         raise TypeError(f"Loss {name} must be a NamiTorch Tensor or None.")
-    if not np.all(np.isfinite(weight._data)) or np.any(weight._data < 0):
+    if not xp.all(xp.isfinite(weight._data)) or xp.any(weight._data < 0):
         raise ValueError(f"Loss {name} must contain finite, nonnegative values.")
 
 
 def _binary_loss_inputs(input: Tensor, target: Tensor, weight: Tensor | None, reduction: str, pos_weight: Tensor | None = None) -> None:
+    xp = namespace(input)
     _loss_inputs(input, target, reduction)
-    if not np.all(np.isfinite(target._data)) or np.any(target._data < 0) or np.any(target._data > 1):
+    if not xp.all(xp.isfinite(target._data)) or xp.any(target._data < 0) or xp.any(target._data > 1):
         raise ValueError("Binary loss target values must be finite and in [0, 1].")
     for name, value in (("weight", weight), ("pos_weight", pos_weight)):
         _loss_weight(value, name)
@@ -605,27 +642,31 @@ def _binary_loss_inputs(input: Tensor, target: Tensor, weight: Tensor | None, re
             _loss_broadcast(value, input, name)
 
 
+@same_device
 def binary_cross_entropy(input: Tensor, target: Tensor, weight: Tensor | None = None, reduction: str = "mean") -> Tensor:
+    xp = namespace(input)
     _binary_loss_inputs(input, target, weight, reduction)
-    if not np.all(np.isfinite(input._data)) or np.any(input._data < 0) or np.any(input._data > 1):
+    if not xp.all(xp.isfinite(input._data)) or xp.any(input._data < 0) or xp.any(input._data > 1):
         raise ValueError("binary_cross_entropy input probabilities must be finite and in [0, 1].")
     epsilon = float(np.finfo(input.dtype.numpy_dtype).eps)
-    probability = input.clamp(min=Tensor(epsilon, dtype=input.dtype), max=Tensor(1 - epsilon, dtype=input.dtype))
-    one = Tensor(1, dtype=input.dtype)
+    probability = input.clamp(min=Tensor(epsilon, dtype=input.dtype, device=input.device), max=Tensor(1 - epsilon, dtype=input.dtype, device=input.device))
+    one = Tensor(1, dtype=input.dtype, device=input.device)
     loss = -(target * probability.log() + (one - target) * (-probability).log1p())
     if weight is not None:
         loss = loss * weight
     return _reduce_loss(loss, reduction)
 
 
+@same_device
 def binary_cross_entropy_with_logits(
     input: Tensor, target: Tensor, weight: Tensor | None = None,
     reduction: str = "mean", pos_weight: Tensor | None = None,
 ) -> Tensor:
+    xp = namespace(input)
     _binary_loss_inputs(input, target, weight, reduction, pos_weight)
-    if not np.all(np.isfinite(input._data)):
+    if not xp.all(xp.isfinite(input._data)):
         raise ValueError("binary_cross_entropy_with_logits input must contain finite logits.")
-    one = Tensor(1, dtype=input.dtype)
+    one = Tensor(1, dtype=input.dtype, device=input.device)
     positive = target * (-input).softplus()
     if pos_weight is not None:
         positive = positive * pos_weight
@@ -652,6 +693,7 @@ def _label_smoothing(value: object) -> float:
 
 
 def _class_loss_arguments(input: Tensor, target: Tensor, weight: Tensor | None, ignore_index: int, reduction: str):
+    xp = namespace(input)
     _loss_reduction(reduction)
     _require_input(input)
     if not input.dtype.is_floating_point:
@@ -670,10 +712,10 @@ def _class_loss_arguments(input: Tensor, target: Tensor, weight: Tensor | None, 
     target_values = target._data.reshape(-1)
     valid = target_values != ignored
     selected = target_values[valid]
-    if np.any(selected < 0) or np.any(selected >= classes):
+    if xp.any(selected < 0) or xp.any(selected >= classes):
         raise IndexError(f"Every non-ignored target must be in [0, {classes}).")
-    indices = Tensor._from_array(np.asarray(selected, dtype=np.int64), False)
-    positions = Tensor._from_array(np.flatnonzero(valid).astype(np.int64, copy=False), False)
+    indices = Tensor._from_array(xp.asarray(selected, dtype=np.int64), False)
+    positions = Tensor._from_array(xp.flatnonzero(valid).astype(np.int64, copy=False), False)
     return input.reshape(target.numel(), classes), indices, positions
 
 
@@ -681,9 +723,10 @@ def _classification_loss(
     input: Tensor, target: Tensor, weight: Tensor | None, ignore_index: int,
     reduction: str, label_smoothing: float, from_logits: bool,
 ) -> Tensor:
+    xp = namespace(input)
     flat_input, indices, positions = _class_loss_arguments(input, target, weight, ignore_index, reduction)
     example_weights = None if weight is None else weight[indices]
-    denominator = Tensor(indices.numel(), dtype=input.dtype) if weight is None else example_weights.sum()
+    denominator = Tensor(indices.numel(), dtype=input.dtype, device=input.device) if weight is None else example_weights.sum()
     if reduction == "mean" and denominator.item() == 0:
         zero = flat_input[:0].sum()
         return zero if weight is None else zero + weight[:0].sum()
@@ -695,15 +738,16 @@ def _classification_loss(
     if label_smoothing != 0:
         weighted_log_probabilities = log_probabilities if weight is None else log_probabilities * weight
         smooth_loss = -weighted_log_probabilities.mean(dim=-1)
-        epsilon = Tensor(label_smoothing, dtype=loss.dtype)
-        confidence = Tensor(1 - label_smoothing, dtype=loss.dtype)
+        epsilon = Tensor(label_smoothing, dtype=loss.dtype, device=loss.device)
+        confidence = Tensor(1 - label_smoothing, dtype=loss.dtype, device=loss.device)
         loss = confidence * loss + epsilon * smooth_loss
     if reduction == "none":
-        output = Tensor._from_array(np.zeros(target.numel(), dtype=loss.dtype.numpy_dtype), False)
+        output = Tensor._from_array(xp.zeros(target.numel(), dtype=loss.dtype.numpy_dtype), False)
         return output.scatter_add(0, positions, loss).reshape(target.shape)
     return _reduce_loss(loss, reduction, denominator)
 
 
+@same_device
 def nll_loss(
     input: Tensor, target: Tensor, weight: Tensor | None = None,
     ignore_index: int = -100, reduction: str = "mean",
@@ -711,6 +755,7 @@ def nll_loss(
     return _classification_loss(input, target, weight, ignore_index, reduction, 0.0, False)
 
 
+@same_device
 def cross_entropy(
     input: Tensor, target: Tensor, weight: Tensor | None = None,
     ignore_index: int = -100, reduction: str = "mean", label_smoothing: float = 0.0,

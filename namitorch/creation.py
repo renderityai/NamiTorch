@@ -2,6 +2,8 @@ import math
 
 import numpy as np
 
+from .backends import namespace
+
 from .dtype import DType, get_default_dtype, normalize_dtype, result_type
 from .tensor import Tensor, _validate_requires_grad
 from .utils import normalize_shape
@@ -29,29 +31,33 @@ def _finite_real(value: object) -> int | float:
     return scalar
 
 
-def zeros(*shape: object, dtype: object = None, requires_grad: bool = False) -> Tensor:
+def zeros(*shape: object, dtype: object = None, requires_grad: bool = False, device=None) -> Tensor:
+    xp = namespace(device)
     dimensions = normalize_shape(*shape)
     target = _factory_dtype(dtype, requires_grad)
-    return Tensor._from_array(np.zeros(dimensions, dtype=target.numpy_dtype), requires_grad)
+    return Tensor._from_array(xp.zeros(dimensions, dtype=target.numpy_dtype), requires_grad)
 
 
-def ones(*shape: object, dtype: object = None, requires_grad: bool = False) -> Tensor:
+def ones(*shape: object, dtype: object = None, requires_grad: bool = False, device=None) -> Tensor:
+    xp = namespace(device)
     dimensions = normalize_shape(*shape)
     target = _factory_dtype(dtype, requires_grad)
-    return Tensor._from_array(np.ones(dimensions, dtype=target.numpy_dtype), requires_grad)
+    return Tensor._from_array(xp.ones(dimensions, dtype=target.numpy_dtype), requires_grad)
 
 
-def empty(*shape: object, dtype: object = None, requires_grad: bool = False) -> Tensor:
+def empty(*shape: object, dtype: object = None, requires_grad: bool = False, device=None) -> Tensor:
+    xp = namespace(device)
     dimensions = normalize_shape(*shape)
     target = _factory_dtype(dtype, requires_grad)
-    return Tensor._from_array(np.empty(dimensions, dtype=target.numpy_dtype), requires_grad)
+    return Tensor._from_array(xp.empty(dimensions, dtype=target.numpy_dtype), requires_grad)
 
 
-def full(shape: object, fill_value: object, *, dtype: object = None, requires_grad: bool = False) -> Tensor:
+def full(shape: object, fill_value: object, *, dtype: object = None, requires_grad: bool = False, device=None) -> Tensor:
+    xp = namespace(device)
     dimensions = normalize_shape(shape)
     scalar = _scalar(fill_value)
     target = _factory_dtype(dtype, requires_grad, result_type(fill_value))
-    array = np.full(dimensions, scalar, dtype=target.numpy_dtype)
+    array = xp.full(dimensions, scalar, dtype=target.numpy_dtype)
     return Tensor._from_array(array, requires_grad)
 
 
@@ -61,32 +67,33 @@ def _like_dtype(input: Tensor, dtype: object, requires_grad: bool) -> DType:
     return _factory_dtype(dtype, requires_grad, input.dtype)
 
 
-def zeros_like(input: Tensor, *, dtype: object = None, requires_grad: bool = False) -> Tensor:
+def zeros_like(input: Tensor, *, dtype: object = None, requires_grad: bool = False, device=None) -> Tensor:
     target = _like_dtype(input, dtype, requires_grad)
-    return zeros(input.shape, dtype=target, requires_grad=requires_grad)
+    return zeros(input.shape, dtype=target, requires_grad=requires_grad, device=input.device if device is None else device)
 
 
-def ones_like(input: Tensor, *, dtype: object = None, requires_grad: bool = False) -> Tensor:
+def ones_like(input: Tensor, *, dtype: object = None, requires_grad: bool = False, device=None) -> Tensor:
     target = _like_dtype(input, dtype, requires_grad)
-    return ones(input.shape, dtype=target, requires_grad=requires_grad)
+    return ones(input.shape, dtype=target, requires_grad=requires_grad, device=input.device if device is None else device)
 
 
-def empty_like(input: Tensor, *, dtype: object = None, requires_grad: bool = False) -> Tensor:
+def empty_like(input: Tensor, *, dtype: object = None, requires_grad: bool = False, device=None) -> Tensor:
     target = _like_dtype(input, dtype, requires_grad)
-    return empty(input.shape, dtype=target, requires_grad=requires_grad)
+    return empty(input.shape, dtype=target, requires_grad=requires_grad, device=input.device if device is None else device)
 
 
 def full_like(
-    input: Tensor, fill_value: object, *, dtype: object = None, requires_grad: bool = False
+    input: Tensor, fill_value: object, *, dtype: object = None, requires_grad: bool = False, device=None
 ) -> Tensor:
     target = _like_dtype(input, dtype, requires_grad)
-    return full(input.shape, fill_value, dtype=target, requires_grad=requires_grad)
+    return full(input.shape, fill_value, dtype=target, requires_grad=requires_grad, device=input.device if device is None else device)
 
 
 def arange(
     start: object, stop: object = None, step: object = None,
-    *, dtype: object = None, requires_grad: bool = False,
+    *, dtype: object = None, requires_grad: bool = False, device=None,
 ) -> Tensor:
+    xp = namespace(device)
     arguments = [start]
     if stop is not None:
         arguments.append(stop)
@@ -101,46 +108,49 @@ def arange(
     if target.is_boolean:
         raise TypeError("arange requires a floating or integer dtype.")
     if target.is_integer and any(isinstance(value, float) for value in (first, last, stride)):
-        array = np.arange(first, last, stride, dtype=np.float64).astype(target.numpy_dtype)
+        array = xp.arange(first, last, stride, dtype=np.float64).astype(target.numpy_dtype)
     else:
-        array = np.arange(first, last, stride, dtype=target.numpy_dtype)
+        array = xp.arange(first, last, stride, dtype=target.numpy_dtype)
     return Tensor._from_array(array, requires_grad)
 
 
 def linspace(
     start: object, end: object, steps: object,
-    *, dtype: object = None, requires_grad: bool = False,
+    *, dtype: object = None, requires_grad: bool = False, device=None,
 ) -> Tensor:
+    xp = namespace(device)
     first, last = _finite_real(start), _finite_real(end)
     count = normalize_shape((steps,))[0]
     target = _factory_dtype(dtype, requires_grad)
-    array = np.linspace(first, last, num=count, dtype=target.numpy_dtype)
+    array = xp.linspace(first, last, num=count, dtype=target.numpy_dtype)
     return Tensor._from_array(array, requires_grad)
 
 
 def logspace(
     start: object, end: object, steps: object, base: object = 10.0,
-    *, dtype: object = None, requires_grad: bool = False,
+    *, dtype: object = None, requires_grad: bool = False, device=None,
 ) -> Tensor:
+    xp = namespace(device)
     first, last, radix = _finite_real(start), _finite_real(end), _finite_real(base)
     if radix <= 0:
         raise ValueError("logspace base must be positive.")
     count = normalize_shape((steps,))[0]
     target = _factory_dtype(dtype, requires_grad)
-    exponents = np.linspace(first, last, num=count, dtype=np.float64)
-    array = np.power(radix, exponents).astype(target.numpy_dtype)
+    exponents = xp.linspace(first, last, num=count, dtype=np.float64)
+    array = xp.power(radix, exponents).astype(target.numpy_dtype)
     return Tensor._from_array(array, requires_grad)
 
 
-def eye(n: object, m: object = None, *, dtype: object = None, requires_grad: bool = False) -> Tensor:
+def eye(n: object, m: object = None, *, dtype: object = None, requires_grad: bool = False, device=None) -> Tensor:
+    xp = namespace(device)
     rows, columns = normalize_shape(n, n if m is None else m)
     target = _factory_dtype(dtype, requires_grad)
-    array = np.eye(rows, columns, dtype=target.numpy_dtype)
+    array = xp.eye(rows, columns, dtype=target.numpy_dtype)
     return Tensor._from_array(array, requires_grad)
 
 
-def identity(n: object, *, dtype: object = None, requires_grad: bool = False) -> Tensor:
-    return eye(n, dtype=dtype, requires_grad=requires_grad)
+def identity(n: object, *, dtype: object = None, requires_grad: bool = False, device=None) -> Tensor:
+    return eye(n, dtype=dtype, requires_grad=requires_grad, device=device)
 
 
 __all__ = [

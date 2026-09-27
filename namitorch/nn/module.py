@@ -4,8 +4,7 @@ from collections import OrderedDict
 from collections.abc import Mapping
 from typing import NamedTuple
 
-import numpy as np
-
+from ..backends import is_array, namespace, same_device, transfer, writable
 from ..autograd import no_grad
 from ..tensor import Tensor
 from .parameter import Parameter
@@ -30,6 +29,35 @@ class LoadStateDictResult(NamedTuple):
 
 
 class Module:
+    def to(self, device=None, dtype=None):
+        values = list(self.parameters()) + list(self.buffers())
+        staged = {}
+        with no_grad():
+            for value in values:
+                if id(value) in staged:
+                    continue
+                target_dtype = dtype if value.dtype.is_floating_point else None
+                converted = value.to(device=device, dtype=target_dtype)
+                if value.requires_grad and not converted.dtype.can_require_grad:
+                    raise ValueError("Module parameters requiring gradients must keep a floating dtype.")
+                gradient = None if value.grad is None else value.grad.to(device=device, dtype=target_dtype)
+                staged[id(value)] = (value, converted, gradient)
+            for value, converted, gradient in staged.values():
+                if value.device == converted.device and value.dtype is converted.dtype:
+                    continue
+                required = value.requires_grad
+                value._version_counter.increment()
+                value._initialize(converted._data, required, converted._version_counter)
+                value._grad = gradient
+        return self
+
+    def cpu(self):
+        return self.to("cpu")
+
+    def cuda(self, index=0):
+        from ..device import Device
+        return self.to(Device("cuda", index))
+
     def __init__(self):
         if "_parameters" in self.__dict__:
             raise RuntimeError("Module.__init__() has already been called.")
@@ -220,7 +248,7 @@ class Module:
             if name not in supplied:
                 continue
             source = supplied[name]
-            if not isinstance(source, (Tensor, np.ndarray)):
+            if not isinstance(source, Tensor) and not is_array(source):
                 errors.append(f"State {name!r} must be a Tensor or NumPy array.")
                 continue
             array = source._data if isinstance(source, Tensor) else source
@@ -230,14 +258,14 @@ class Module:
             if array.dtype != target.dtype.numpy_dtype:
                 errors.append(f"Dtype mismatch for {name!r}: expected {target.dtype.name}, received {array.dtype}; explicit conversion is required.")
                 continue
-            if not target._data.flags.writeable:
+            if not target._writable or not writable(target._data):
                 errors.append(f"Cannot load {name!r} into read-only Tensor storage.")
                 continue
-            snapshot = np.array(array, copy=True)
+            snapshot = transfer(array, target.device, copy=True)
             identity = id(target)
             if identity in updates:
                 previous_name, _, previous = updates[identity]
-                if not np.array_equal(previous, snapshot, equal_nan=True):
+                if not namespace(previous).array_equal(previous, snapshot, equal_nan=True):
                     errors.append(f"Conflicting values for aliased state keys {previous_name!r} and {name!r}.")
             else:
                 updates[identity] = (name, target, snapshot)
@@ -299,6 +327,7 @@ class Module:
             parameter.requires_grad_(requires_grad)
         return self
 
+    @same_device
     def __call__(self, *args, **kwargs):
         forward = getattr(self, "forward", None)
         if not callable(forward):

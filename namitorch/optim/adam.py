@@ -1,5 +1,7 @@
 import numpy as np
 
+from ..backends import namespace, same_device
+
 from ..tensor import Tensor
 from ._common import _FirstOrderOptimizer, _apply_update, _buffer, _gradient, _real_option, _scalar
 
@@ -23,7 +25,9 @@ class Adam(_FirstOrderOptimizer):
         prepared["betas"] = tuple(_real_option(normalized, name, unit_interval=True) for name in ("beta1", "beta2"))
         return prepared
 
+    @same_device
     def _update_parameter(self, parameter: Tensor, gradient: Tensor, options: dict) -> None:
+        xp = namespace(parameter)
         grad = _gradient(parameter, gradient, options, self._decoupled_weight_decay)
         state = self.state[id(parameter)]
         first = _buffer(state, "exp_avg", parameter)
@@ -35,7 +39,7 @@ class Adam(_FirstOrderOptimizer):
         state["step"] = step
         first_corrected = first._data / _scalar(parameter, 1 - beta1 ** step)
         second_corrected = second._data / _scalar(parameter, 1 - beta2 ** step)
-        denominator = np.sqrt(second_corrected) + _scalar(parameter, options["eps"], "eps")
+        denominator = xp.sqrt(second_corrected) + _scalar(parameter, options["eps"], "eps")
         _apply_update(parameter, first_corrected / denominator, options, self._decoupled_weight_decay)
 
 

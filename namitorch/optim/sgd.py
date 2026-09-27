@@ -1,3 +1,4 @@
+from ..backends import same_device
 from ..tensor import Tensor
 from ._common import _FirstOrderOptimizer, _apply_update, _bool_option, _gradient, _real_option, _scalar
 
@@ -16,12 +17,13 @@ class SGD(_FirstOrderOptimizer):
             raise ValueError("Nesterov requires momentum > 0 and dampening == 0.")
         return prepared
 
+    @same_device
     def _update_parameter(self, parameter: Tensor, gradient: Tensor, options: dict) -> None:
         update = _gradient(parameter, gradient, options)
         if options["momentum"] != 0:
             state = self.state[id(parameter)]
             if "momentum_buffer" not in state:
-                state["momentum_buffer"] = Tensor(update, dtype=parameter.dtype)
+                state["momentum_buffer"] = Tensor(update, dtype=parameter.dtype, device=parameter.device)
             else:
                 buffer = state["momentum_buffer"]
                 buffer.copy_(_scalar(parameter, options["momentum"]) * buffer._data + _scalar(parameter, 1 - options["dampening"]) * update)

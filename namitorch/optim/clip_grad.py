@@ -3,6 +3,8 @@ from numbers import Real
 
 import numpy as np
 
+from ..backends import ensure_same_device, namespace, same_device, writable
+
 from ..autograd import no_grad
 from ..tensor import Tensor
 
@@ -52,41 +54,33 @@ def _gradients(parameters) -> list[Tensor]:
             raise TypeError("Gradients must be floating NamiTorch Tensors.")
         if gradient.shape != parameter.shape:
             raise ValueError(f"Gradient shape {gradient.shape} does not match parameter shape {parameter.shape}.")
+        ensure_same_device(parameter, gradient)
         seen.add(id(gradient))
         gradients.append(gradient)
     return gradients
 
 
-def _total_norm(gradients: list[Tensor], norm_type: float) -> float:
-    scale = 0.0
+@same_device
+def _total_norm(gradients: list[Tensor], norm_type: float):
+    xp = namespace(gradients[0] if gradients else None)
+    scale = xp.asarray(0.0, dtype=np.float64)
     for gradient in gradients:
-        data = gradient._data
-        if np.any(np.isnan(data)):
-            return math.nan
-        scale = max(scale, float(np.max(np.abs(data), initial=0)))
-    if scale == 0 or math.isinf(scale) or math.isinf(norm_type):
-        return scale
-    totals = []
-    with np.errstate(under="ignore"):
+        scale = xp.maximum(scale, xp.max(xp.abs(gradient._data), initial=0))
+    if not bool(xp.isfinite(scale)) or bool(scale == 0) or math.isinf(norm_type):
+        return xp.asarray(scale, dtype=np.float64)
+    total = xp.asarray(0.0, dtype=np.float64)
+    with xp.errstate(over="ignore", divide="ignore", invalid="ignore", under="ignore"):
         for gradient in gradients:
-            scaled = np.abs(gradient._data.astype(np.float64, copy=False)) / scale
-            totals.append(float(np.sum(np.power(scaled, norm_type), dtype=np.float64)))
-    total = math.fsum(totals)
-    try:
-        result = scale * math.pow(total, 1 / norm_type)
-        if math.isfinite(result):
-            return result
-    except OverflowError:
-        result = math.inf
-    logarithm = math.log(scale) + math.log(total) / norm_type
-    try:
-        return math.exp(logarithm)
-    except OverflowError:
-        return math.inf
+            scaled = xp.abs(xp.asarray(gradient._data, dtype=np.float64)) / scale
+            total = total + xp.sum(xp.power(scaled, norm_type), dtype=np.float64)
+        result = scale * xp.power(total, 1 / norm_type)
+        if not bool(xp.isfinite(result)):
+            result = xp.exp(xp.log(scale) + xp.log(total) / norm_type)
+    return xp.asarray(result, dtype=np.float64)
 
 
-def _norm_tensor(norm: float) -> Tensor:
-    return Tensor._from_array(np.asarray(norm, dtype=np.float64), False)
+def _norm_tensor(norm) -> Tensor:
+    return Tensor._from_array(norm, False)
 
 
 def get_grad_norm(parameters, norm_type: float = 2) -> Tensor:
@@ -95,7 +89,7 @@ def get_grad_norm(parameters, norm_type: float = 2) -> Tensor:
 
 
 def _require_writable(gradients: list[Tensor]) -> None:
-    if any(not gradient._data.flags.writeable for gradient in gradients):
+    if any(not gradient._writable or not writable(gradient._data) for gradient in gradients):
         raise RuntimeError("Cannot clip read-only gradient storage.")
 
 
@@ -106,14 +100,15 @@ def clip_grad_norm_(parameters, max_norm: float, norm_type: float = 2, error_if_
         raise TypeError("error_if_nonfinite must be a Python bool.")
     gradients = _gradients(parameters)
     norm = _total_norm(gradients, order)
-    if error_if_nonfinite and not math.isfinite(norm):
+    xp = namespace(norm)
+    if error_if_nonfinite and not bool(xp.isfinite(norm)):
         raise RuntimeError(f"Cannot clip gradients with nonfinite total norm {norm}.")
-    coefficient = maximum / (norm + 1e-6)
+    coefficient = xp.divide(maximum, xp.add(norm, 1e-6))
     if coefficient < 1:
         _require_writable(gradients)
         with no_grad(), np.errstate(invalid="ignore", under="ignore"):
             for gradient in gradients:
-                gradient.copy_(gradient._data.astype(np.float64, copy=False) * coefficient)
+                gradient.copy_(xp.multiply(xp.asarray(gradient._data, dtype=np.float64), coefficient))
     return _norm_tensor(norm)
 
 
@@ -123,7 +118,7 @@ def clip_grad_value_(parameters, clip_value: float) -> None:
     _require_writable(gradients)
     with no_grad():
         for gradient in gradients:
-            gradient.copy_(np.clip(gradient._data.astype(np.float64, copy=False), -bound, bound))
+            gradient.copy_(namespace(gradient).clip(namespace(gradient).asarray(gradient._data, dtype=np.float64), -bound, bound))
 
 
 __all__ = ["get_grad_norm", "clip_grad_norm_", "clip_grad_value_"]

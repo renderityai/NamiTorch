@@ -1,3 +1,6 @@
+from .device import Device, device
+from . import cuda
+from .backends import get_array_module
 from .autograd import enable_grad, is_grad_enabled, no_grad, set_grad_enabled
 from . import data, models, nn, optim, tokenization
 from .models import CausalLMOutput, GPT, GPTConfig, sample_next_token
@@ -123,6 +126,7 @@ from .training import load_checkpoint, save_checkpoint
 __version__ = "0.0.1"
 
 __all__ = [
+    "Device", "device", "cuda", "get_array_module",
     "__version__",
     "Tensor",
     "SerializationError",

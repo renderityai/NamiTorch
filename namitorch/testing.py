@@ -84,7 +84,7 @@ def gradcheck(
                 if not math.isfinite(perturbed) or perturbed == original:
                     raise GradcheckError(f"{name}: eps={eps} cannot perturb input {position}, index {index}, value {original} safely in float64.")
                 data[index] = perturbed
-            values.append(Tensor(data, requires_grad=flag))
+            values.append(Tensor(data, requires_grad=flag, device=originals[number].device))
         return tuple(values)
 
     rng = np.random.default_rng(seed)
@@ -97,7 +97,7 @@ def gradcheck(
             name = f"{name} [{output.grad_fn.name}]"
         upstream = np.asarray(rng.standard_normal(output.shape), dtype=np.float64)
         if output.requires_grad:
-            loss = (output * Tensor(upstream, dtype=float64)).sum()
+            loss = (output * Tensor(upstream, dtype=float64, device=output.device)).sum()
             loss.backward()
     analytical = tuple(value.grad.numpy() if value.grad is not None else np.zeros(value.shape, dtype=np.float64) for value in analytical_inputs)
     with no_grad():

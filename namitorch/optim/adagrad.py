@@ -1,5 +1,7 @@
 import numpy as np
 
+from ..backends import namespace, same_device
+
 from ..tensor import Tensor
 from ._common import _FirstOrderOptimizer, _apply_update, _buffer, _gradient, _real_option, _scalar
 
@@ -18,13 +20,15 @@ class Adagrad(_FirstOrderOptimizer):
         _real_option(prepared, "eps", positive=True)
         return prepared
 
+    @same_device
     def _update_parameter(self, parameter: Tensor, gradient: Tensor, options: dict) -> None:
+        xp = namespace(parameter)
         grad = _gradient(parameter, gradient, options)
         state = self.state[id(parameter)]
         total = _buffer(state, "sum", parameter)
         total.copy_(total._data + grad * grad)
         state["step"] = state.get("step", 0) + 1
-        denominator = np.sqrt(total._data) + _scalar(parameter, options["eps"], "eps")
+        denominator = xp.sqrt(total._data) + _scalar(parameter, options["eps"], "eps")
         _apply_update(parameter, grad / denominator, options)
 
 

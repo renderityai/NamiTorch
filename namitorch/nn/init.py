@@ -3,6 +3,8 @@ from numbers import Real
 
 import numpy as np
 
+from ..backends import get_backend, namespace, same_device, writable
+
 from ..autograd import no_grad
 from ..random import Generator, _get_rng, _validate_generator, rand, randn
 from ..tensor import Tensor
@@ -13,7 +15,7 @@ def _tensor(tensor: Tensor, floating: bool = False) -> Tensor:
         raise TypeError("Initialization requires a NamiTorch Tensor.")
     if floating and not tensor.dtype.is_floating_point:
         raise TypeError("Random initialization requires a floating Tensor.")
-    if not tensor._data.flags.writeable:
+    if not tensor._writable or not writable(tensor._data):
         raise RuntimeError("Cannot initialize read-only Tensor storage.")
     return tensor
 
@@ -55,8 +57,8 @@ def uniform_(tensor: Tensor, a: float = 0.0, b: float = 1.0, *, generator: Gener
     if width == 0:
         return constant_(tensor, lower)
     with no_grad():
-        values = rand(tensor.shape, dtype=tensor.dtype, generator=generator)
-        return tensor.copy_(values * Tensor(width, dtype=tensor.dtype) + Tensor(lower, dtype=tensor.dtype))
+        values = rand(tensor.shape, dtype=tensor.dtype, generator=generator, device=tensor.device)
+        return tensor.copy_(values * Tensor(width, dtype=tensor.dtype, device=tensor.device) + Tensor(lower, dtype=tensor.dtype, device=tensor.device))
 
 
 def normal_(tensor: Tensor, mean: float = 0.0, std: float = 1.0, *, generator: Generator | None = None) -> Tensor:
@@ -66,8 +68,8 @@ def normal_(tensor: Tensor, mean: float = 0.0, std: float = 1.0, *, generator: G
     if deviation <= 0 or tensor.dtype.numpy_dtype.type(deviation) == 0:
         raise ValueError("normal_ requires a positive, representable std.")
     with no_grad():
-        values = randn(tensor.shape, dtype=tensor.dtype, generator=generator)
-        return tensor.copy_(values * Tensor(deviation, dtype=tensor.dtype) + Tensor(center, dtype=tensor.dtype))
+        values = randn(tensor.shape, dtype=tensor.dtype, generator=generator, device=tensor.device)
+        return tensor.copy_(values * Tensor(deviation, dtype=tensor.dtype, device=tensor.device) + Tensor(center, dtype=tensor.dtype, device=tensor.device))
 
 
 def _finite_real(value: object, name: str) -> float:
@@ -161,7 +163,9 @@ def _normal_interval_probability(lower: float, upper: float) -> float:
     return 0.5 * (math.erf(upper / scale) - math.erf(lower / scale))
 
 
+@same_device
 def trunc_normal_(tensor: Tensor, mean: float = 0.0, std: float = 1.0, a: float = -2.0, b: float = 2.0, *, generator: Generator | None = None) -> Tensor:
+    xp = namespace(tensor)
     _tensor(tensor, floating=True)
     _validate_generator(generator)
     center, deviation = _real(mean, "mean", tensor), _real(std, "std", tensor)
@@ -175,11 +179,11 @@ def trunc_normal_(tensor: Tensor, mean: float = 0.0, std: float = 1.0, a: float 
         raise ValueError("trunc_normal_ acceptance probability must be at least 1e-6; adjust mean, std or [a, b].")
     lowest = tensor.dtype.numpy_dtype.type(lower)
     if float(lowest) < lower:
-        lowest = np.nextafter(lowest, tensor.dtype.numpy_dtype.type(np.inf))
+        lowest = xp.nextafter(lowest, tensor.dtype.numpy_dtype.type(np.inf))
     if float(lowest) > upper:
         raise ValueError("trunc_normal_ interval contains no value representable in the Tensor dtype.")
     count = tensor.numel()
-    values = np.empty(count, dtype=tensor.dtype.numpy_dtype)
+    values = xp.empty(count, dtype=tensor.dtype.numpy_dtype)
     rng = _get_rng(generator)
     filled = 0
     remaining_draws = max(10000, math.ceil(10 * count / acceptance))
@@ -188,7 +192,7 @@ def trunc_normal_(tensor: Tensor, mean: float = 0.0, std: float = 1.0, a: float 
             raise RuntimeError("trunc_normal_ exceeded its rejection sampling budget; Tensor storage was not modified.")
         draws = min(65536, remaining_draws, max(32, math.ceil(1.2 * (count - filled) / acceptance)))
         with np.errstate(over="ignore", invalid="ignore"):
-            samples = rng.standard_normal(draws) * deviation + center
+            samples = get_backend(tensor).random(rng, "standard_normal", draws, None) * deviation + center
             accepted = samples[(samples >= lower) & (samples <= upper)].astype(tensor.dtype.numpy_dtype)
         accepted = accepted[(accepted.astype(np.float64) >= lower) & (accepted.astype(np.float64) <= upper)]
         take = min(count - filled, accepted.size)

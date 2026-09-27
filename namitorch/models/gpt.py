@@ -3,6 +3,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from ..backends import namespace, same_device
+
 from ..autograd import no_grad
 from ..nn import Dropout, Embedding, LayerKVCache, Linear, Module, ModuleList, RMSNorm, TransformerBlock, init
 from ..nn import functional as F
@@ -122,12 +124,13 @@ class GPT(Module):
             LayerKVCache(
                 batch_size, self.config.n_kv_heads, self.config.d_model // self.config.n_heads,
                 max_seq_len=self.config.context_length if preallocate else None,
-                dtype=self.token_embedding.weight.dtype,
+                dtype=self.token_embedding.weight.dtype, device=self.token_embedding.weight.device,
             )
             for _ in self.blocks
         ]
 
     def _validate_tokens(self, tokens, name, shape=None, allow_ignore=False):
+        xp = namespace(tokens)
         if not isinstance(tokens, Tensor) or not tokens.dtype.is_integer:
             raise TypeError(f"{name} must be an integer NamiTorch Tensor.")
         if tokens.ndim != 2 or (shape is not None and tokens.shape != shape):
@@ -137,7 +140,7 @@ class GPT(Module):
         invalid = (values < 0) | (values >= self.config.vocab_size)
         if allow_ignore:
             invalid &= values != -1
-        if np.any(invalid):
+        if xp.any(invalid):
             raise ValueError(f"{name} contains token IDs outside [0, {self.config.vocab_size}).")
 
     def _prepare_cache(self, cache, batch, length, use_cache):
@@ -196,6 +199,7 @@ class GPT(Module):
             raise
         return CausalLMOutput(logits=logits, loss=loss, cache=new_cache)
 
+    @same_device
     def generate(
         self, input_ids: Tensor, max_new_tokens: int = 20, *, temperature: float = 1.0,
         top_k: int | None = None, top_p: float = 1.0, repetition_penalty: float = 1.0,
@@ -203,6 +207,7 @@ class GPT(Module):
         eos_token_id: int | None = None, pad_token_id: int | None = None,
         generator: Generator | None = None,
     ) -> Tensor:
+        xp = namespace(input_ids)
         self._validate_tokens(input_ids, "input_ids")
         batch, prompt_length = input_ids.shape
         if batch == 0 or prompt_length == 0:
@@ -229,29 +234,29 @@ class GPT(Module):
             with no_grad():
                 if max_new_tokens == 0:
                     return input_ids.clone()
-                history = np.empty((batch, prompt_length + max_new_tokens), dtype=np.int64)
+                history = xp.empty((batch, prompt_length + max_new_tokens), dtype=np.int64)
                 history[:, :prompt_length] = input_ids._data
                 length = prompt_length
-                finished = np.zeros(batch, dtype=np.bool_)
+                finished = xp.zeros(batch, dtype=np.bool_)
                 cache = self.create_cache(batch)
                 result = self(input_ids, cache=cache, use_cache=True)
                 for step in range(max_new_tokens):
-                    active = np.flatnonzero(~finished)
+                    active = xp.flatnonzero(~finished)
                     sampled = sample_next_token(
                         result.logits[active, -1, :], Tensor._from_array(history[active, :length], False),
                         **options, generator=generator,
                     )
                     fill = pad_token_id if pad_token_id is not None else eos_token_id
-                    next_tokens = np.full((batch, 1), 0 if fill is None else fill, dtype=np.int64)
+                    next_tokens = xp.full((batch, 1), 0 if fill is None else fill, dtype=np.int64)
                     next_tokens[active] = sampled._data
                     history[:, length:length + 1] = next_tokens
                     length += 1
                     if eos_token_id is not None:
                         finished[active] |= sampled._data[:, 0] == eos_token_id
-                    if np.all(finished) or step + 1 == max_new_tokens:
+                    if xp.all(finished) or step + 1 == max_new_tokens:
                         break
                     result = self(Tensor._from_array(next_tokens, False), cache=result.cache, use_cache=True)
-                return Tensor(history[:, :length])
+                return Tensor._from_array(history[:, :length].copy(), False)
         finally:
             for module, training in modes:
                 module.training = training

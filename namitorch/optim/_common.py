@@ -3,6 +3,8 @@ from numbers import Real
 
 import numpy as np
 
+from ..backends import ensure_same_device, is_array, namespace, writable
+
 from ..autograd import enable_grad, no_grad
 from ..dtype import from_numpy_dtype
 from ..tensor import Tensor
@@ -44,15 +46,17 @@ def _scalar(parameter: Tensor, value: float, name: str = "coefficient"):
 
 
 def _buffer(state: dict, name: str, parameter: Tensor) -> Tensor:
+    xp = namespace(parameter)
     if name not in state:
-        state[name] = Tensor._from_array(np.zeros_like(parameter._data), False)
+        state[name] = Tensor._from_array(xp.zeros_like(parameter._data), False)
     return state[name]
 
 
 def _gradient(parameter: Tensor, gradient: Tensor, options: dict, decoupled: bool = False) -> np.ndarray:
+    xp = namespace(parameter)
     result = gradient._data.copy()
     if options["maximize"]:
-        np.negative(result, out=result)
+        xp.negative(result, out=result)
     if options["weight_decay"] != 0 and not decoupled:
         result += _scalar(parameter, options["weight_decay"]) * parameter._data
     return result
@@ -96,7 +100,7 @@ class _FirstOrderOptimizer(Optimizer):
             if name not in values:
                 continue
             value = values[name]
-            if not isinstance(value, (Tensor, np.ndarray)):
+            if not (isinstance(value, Tensor) or is_array(value)):
                 raise TypeError(f"{path}[{name!r}] must be a floating Tensor or NumPy array.")
             dtype = value.dtype if isinstance(value, Tensor) else from_numpy_dtype(value.dtype)
             if not dtype.is_floating_point:
@@ -104,12 +108,14 @@ class _FirstOrderOptimizer(Optimizer):
             if value.shape != parameter.shape:
                 raise ValueError(f"{path}[{name!r}] shape {value.shape} must equal parameter shape {parameter.shape}.")
             array = value._data if isinstance(value, Tensor) else value
-            if name in self._nonnegative_buffers and np.any(array < 0):
+            xp = namespace(array)
+            if name in self._nonnegative_buffers and xp.any(xp.less(array, 0)):
                 raise ValueError(f"{path}[{name!r}] must be nonnegative.")
             if runtime:
+                ensure_same_device(parameter, value)
                 if not isinstance(value, Tensor) or dtype is not parameter.dtype:
                     raise TypeError(f"{path}[{name!r}] must be a Tensor with parameter dtype {parameter.dtype.name}.")
-                if value.requires_grad or value.grad_fn is not None or not array.flags.writeable:
+                if value.requires_grad or value.grad_fn is not None or not value._writable or not writable(array):
                     raise RuntimeError(f"{path}[{name!r}] must be writable and detached from autograd.")
 
     def _prepare_state(self, values: dict, parameter: Tensor, path: str) -> dict:
@@ -119,7 +125,7 @@ class _FirstOrderOptimizer(Optimizer):
             raise TypeError("Nonfloating parameters cannot have optimizer accumulation buffers.")
         for name in self._state_buffers:
             if name in copied:
-                copied[name] = Tensor(copied[name], dtype=parameter.dtype)
+                copied[name] = Tensor(copied[name], dtype=parameter.dtype, device=parameter.device)
         return copied
 
     def step(self, closure=None):
@@ -137,7 +143,7 @@ class _FirstOrderOptimizer(Optimizer):
         for group, parameter, _ in entries:
             if not parameter.dtype.is_floating_point:
                 raise TypeError("Optimizer updates require floating parameters.")
-            if not parameter._data.flags.writeable:
+            if not parameter._writable or not writable(parameter._data):
                 raise RuntimeError("Optimizer cannot update read-only parameter storage.")
             prepared = options[id(group)]
             for name, value in prepared.items():
