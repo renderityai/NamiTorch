@@ -141,7 +141,7 @@ class _FirstOrderOptimizer(Optimizer):
             id(group): self._prepare_options({key: value for key, value in group.items() if key != "params"}, "param_group")
             for group in self.param_groups
         }
-        for group, parameter, _ in entries:
+        for group, parameter, gradient in entries:
             if not parameter.dtype.is_floating_point:
                 raise TypeError("Optimizer updates require floating parameters.")
             if not parameter._writable or not writable(parameter._data):
@@ -153,6 +153,9 @@ class _FirstOrderOptimizer(Optimizer):
             if self._decoupled_weight_decay:
                 _scalar(parameter, 1 - prepared["lr"] * prepared["weight_decay"], "decay factor")
             self._check_state(self.state.get(id(parameter), {}), parameter, "parameter state", runtime=True)
+            validate_update = getattr(self, "_validate_update", None)
+            if validate_update is not None:
+                validate_update(parameter, gradient, prepared)
         update = getattr(self, "_update_parameter", None)
         if not callable(update):
             raise RuntimeError("Optimizer subclass must implement parameter updates.")

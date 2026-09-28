@@ -13,6 +13,7 @@ from .kernels import CUDAKernels
 from .fused import FusedCUDAKernels
 from .softmax import SoftmaxCUDAKernels
 from .normalization import NormalizationCUDAKernels
+from .adamw import AdamWCUDAKernel
 
 
 class CUDABackend:
@@ -31,6 +32,7 @@ class CUDABackend:
         self.fused = FusedCUDAKernels(self)
         self.softmax = SoftmaxCUDAKernels(self)
         self.normalization = NormalizationCUDAKernels(self)
+        self.adamw = AdamWCUDAKernel(self)
         self._float16_supported = None
         self.memory.track_allocation = self.execution.allocated
         self.memory.collect_completed = self.collect_transfers
