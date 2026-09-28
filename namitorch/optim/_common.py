@@ -1,3 +1,4 @@
+from ..backends._graph_capture import reject_during_capture
 import math
 from numbers import Real
 from typing import Any as Array
@@ -130,6 +131,7 @@ class _FirstOrderOptimizer(Optimizer):
         return copied
 
     def step(self, closure=None):
+        reject_during_capture('Optimizer steps')
         if closure is not None and not callable(closure):
             raise TypeError("Optimizer closure must be callable or None.")
         loss = None

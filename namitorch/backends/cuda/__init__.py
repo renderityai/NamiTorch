@@ -8,6 +8,7 @@ from .._cuda_memory import CUDAMemory
 from .._cuda_random import CUDARandom
 from .._cuda_runtime import load_cupy, runtime_call
 from .._namespace import ArrayNamespace
+from .._graph_capture import current_capture, reject_during_capture
 from .._pinned import is_pinned
 from .kernels import CUDAKernels
 from .fused import FusedCUDAKernels
@@ -56,6 +57,8 @@ class CUDABackend:
             self.collect_transfers()
 
     def collect_transfers(self):
+        if current_capture() is not None:
+            return
         with self.module.cuda.Device(self.device.index), self._transfer_lock:
             self.execution.collect()
             self._pending_transfers = [entry for entry in self._pending_transfers if not entry[0].done]
@@ -79,6 +82,8 @@ class CUDABackend:
             raise
 
     def array(self, value, dtype=None, copy=True, *, non_blocking=False):
+        if current_capture() is not None and (not isinstance(value, self.array_type) or value.device.id != self.device.index) and not np.isscalar(value):
+            reject_during_capture("Host or cross-device transfers")
         if dtype is not None and np.dtype(dtype) == np.dtype("float16") and not self.supports_float16():
             raise RuntimeError(f"CUDA float16 is not supported on {self.device}.")
         device_input = isinstance(value, self.array_type)

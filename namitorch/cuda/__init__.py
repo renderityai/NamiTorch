@@ -62,8 +62,9 @@ def manual_seed_all(seed):
 
 
 from .streams import Event, Stream, current_stream, default_stream, elapsed_time, stream
-from . import memory
+from . import memory, graphs
+from .graphs import CUDAGraph
 from .memory import NamiTorchCUDAOutOfMemoryError, empty_cache, max_memory_allocated, max_memory_reserved, mem_get_info, memory_allocated, memory_reserved, reset_peak_memory_stats, synchronize
 
 
-__all__ = ["enable_fused_kernels", "fused_kernels_enabled", "Stream", "Event", "current_stream", "default_stream", "stream", "elapsed_time", "is_available", "device_count", "current_device", "set_device", "get_device_name", "get_device_properties", "manual_seed", "manual_seed_all", "memory", "memory_allocated", "memory_reserved", "max_memory_allocated", "max_memory_reserved", "empty_cache", "reset_peak_memory_stats", "mem_get_info", "synchronize", "NamiTorchCUDAOutOfMemoryError"]
+__all__ = ["graphs", "CUDAGraph", "enable_fused_kernels", "fused_kernels_enabled", "Stream", "Event", "current_stream", "default_stream", "stream", "elapsed_time", "is_available", "device_count", "current_device", "set_device", "get_device_name", "get_device_properties", "manual_seed", "manual_seed_all", "memory", "memory_allocated", "memory_reserved", "max_memory_allocated", "max_memory_reserved", "empty_cache", "reset_peak_memory_stats", "mem_get_info", "synchronize", "NamiTorchCUDAOutOfMemoryError"]

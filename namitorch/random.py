@@ -1,3 +1,4 @@
+from .backends._graph_capture import reject_during_capture
 import operator
 from math import prod
 from secrets import randbits
@@ -84,6 +85,7 @@ def _get_default_generator(device=None):
 
 
 def _get_rng(generator: Generator | None = None, *, device=None):
+    reject_during_capture('Random sampling and dropout')
     target = Device("cpu" if device is None else device)
     _validate_generator(generator, target)
     if generator is not None:

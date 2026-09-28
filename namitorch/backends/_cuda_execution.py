@@ -2,6 +2,8 @@ from contextlib import contextmanager
 import sys
 from threading import RLock, local
 
+from ._graph_capture import current_capture, reject_during_capture
+
 
 _executions = {}
 
@@ -37,6 +39,9 @@ class CUDAExecution:
         frame[1].append(resource)
 
     def result(self, value):
+        session = current_capture()
+        if session is not None:
+            session.observe(value)
         frame = getattr(self._local, "frame", None)
         if frame is not None:
             self._inputs(value, frame[0], set())
@@ -59,6 +64,11 @@ class CUDAExecution:
 
     @contextmanager
     def context(self, operands):
+        session = current_capture()
+        if session is not None:
+            if self.device != session.backend.device or self.module.cuda.get_current_stream().ptr != session.stream.ptr:
+                raise RuntimeError("CUDA graph operations must use the dedicated capture stream and device.")
+            session.observe(operands)
         previous = getattr(self._local, "frame", None)
         frame = ({}, [])
         self._inputs(operands, frame[0], set())
@@ -68,7 +78,10 @@ class CUDAExecution:
             yield
         finally:
             self._local.frame = previous
-            if frame[0] or frame[1]:
+            if session is not None:
+                session.memories.update(frame[0])
+                session.resources.extend(frame[1])
+            elif frame[0] or frame[1]:
                 operation_error = sys.exc_info()[1]
                 try:
                     event = self.module.cuda.Event(disable_timing=True)
@@ -88,6 +101,8 @@ class CUDAExecution:
                 self._storage_events.setdefault(key, {})[int(stream.ptr)] = completion
 
     def collect(self):
+        if current_capture() is not None:
+            return
         with self._lock:
             pending = []
             for event, stream, frame in self._pending:
@@ -102,7 +117,18 @@ class CUDAExecution:
                             del self._storage_events[key]
             self._pending = pending
 
+    def wait_for_memories(self, memories, stream):
+        reject_during_capture("Cross-stream graph dependencies")
+        with self._lock:
+            completions = {id(event): event for key in memories for event in self._storage_events.get(key, {}).values()}
+        for completion in completions.values():
+            if isinstance(completion, self.module.cuda.Event):
+                stream.wait_event(completion)
+            else:
+                completion.synchronize()
+
     def synchronize_array(self, array):
+        reject_during_capture("CPU access or synchronization")
         with self.module.cuda.Device(self.device.index):
             with self._lock:
                 events = tuple(self._storage_events.get(self._key(array.data.mem), {}).values())

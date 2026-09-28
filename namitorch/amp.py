@@ -1,3 +1,4 @@
+from .backends._graph_capture import reject_during_capture
 from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import wraps
@@ -124,6 +125,7 @@ class GradScaler:
         return self._scale if self._enabled else 1.0
 
     def scale(self, loss):
+        reject_during_capture('GradScaler')
         dtype = getattr(loss, "dtype", None)
         if not hasattr(dtype, "can_require_grad") or not dtype.can_require_grad or not hasattr(loss, "_data"):
             raise TypeError("GradScaler.scale requires a floating NamiTorch Tensor.")
@@ -165,6 +167,7 @@ class GradScaler:
         return finite
 
     def unscale_(self, optimizer):
+        reject_during_capture("GradScaler")
         if not self._enabled:
             return True
         if not self._scale_used:
@@ -191,6 +194,7 @@ class GradScaler:
         return state["finite"]
 
     def step(self, optimizer):
+        reject_during_capture("GradScaler")
         if not self._enabled:
             optimizer.step()
             return True
@@ -213,6 +217,7 @@ class GradScaler:
         return False
 
     def update(self):
+        reject_during_capture("GradScaler")
         if not self._enabled:
             return
         if not self._optimizer_states or any(state["stage"] != "stepped" for state in self._optimizer_states.values()):

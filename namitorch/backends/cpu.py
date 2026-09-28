@@ -4,6 +4,7 @@ from contextlib import nullcontext
 
 import numpy as np
 
+from ._graph_capture import reject_during_capture
 from ..device import Device
 
 
@@ -15,6 +16,7 @@ class CPUBackend:
     array_type = np.ndarray
 
     def context(self, *operands):
+        reject_during_capture("CPU Tensor operations")
         return nullcontext()
 
     def result(self, value):

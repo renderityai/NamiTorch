@@ -1,6 +1,8 @@
 from contextlib import contextmanager
 from threading import RLock
 
+from ._graph_capture import current_capture
+
 
 class NamiTorchCUDAOutOfMemoryError(MemoryError):
     def __init__(self, device, requested_bytes, allocated_bytes, reserved_bytes, free_bytes, total_bytes):
@@ -49,10 +51,12 @@ class CUDAMemory:
     def allocate(self, size):
         with self.module.cuda.Device(self.device.index), self._lock:
             try:
-                pointer = self.pool.malloc(size)
+                session = current_capture()
+                pointer = self.pool.malloc(size) if session is None else session.allocate(self, size)
             except self.module.cuda.memory.OutOfMemoryError as error:
                 raise self.allocation_error(error, int(size)) from error
-            self._observe()
+            if current_capture() is None or current_capture().phase != "capture":
+                self._observe()
             if self.track_allocation is not None:
                 self.track_allocation(pointer)
             return pointer

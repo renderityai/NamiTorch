@@ -1,3 +1,4 @@
+from .._graph_capture import current_capture
 from dataclasses import dataclass
 from io import StringIO
 from operator import index
@@ -114,6 +115,8 @@ class CUDAKernels:
         with self._lock:
             kernel = self._cache.get(key)
             if kernel is None:
+                if current_capture() is not None and current_capture().phase == "capture":
+                    raise RuntimeError("CUDA graph kernel was not compiled during warmup.")
                 log = StringIO()
                 try:
                     kernel = self._backend.module.RawKernel(key.source, key.name, options=key.options, backend=key.compiler)

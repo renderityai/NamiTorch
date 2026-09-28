@@ -1,4 +1,5 @@
 from __future__ import annotations
+from .backends._graph_capture import reject_during_capture
 
 import builtins
 import math
@@ -422,6 +423,7 @@ class Tensor:
         self._retain_grad = True
 
     def backward(self, gradient: object = None, retain_graph: builtins.bool = False) -> None:
+        reject_during_capture('Backward')
         if type(retain_graph) is not builtins.bool:
             raise TypeError("retain_graph must be a Python bool.")
         if not self.requires_grad:
@@ -466,14 +468,17 @@ class Tensor:
         return self._data.itemsize
 
     def item(self) -> builtins.bool | builtins.int | builtins.float:
+        reject_during_capture("Host Tensor reads")
         if self.size != 1:
             raise ValueError(f"item() requires exactly one element, got {self.size}.")
         return self._backend.item(self._data)
 
     def tolist(self) -> list | builtins.bool | builtins.int | builtins.float:
+        reject_during_capture("Host Tensor reads")
         return self.numpy().tolist()
 
     def numpy(self) -> np.ndarray:
+        reject_during_capture("Host Tensor reads")
         return self._backend.to_numpy(self._data)
 
     def is_pinned(self) -> builtins.bool:
@@ -1245,6 +1250,7 @@ class Tensor:
         return result
 
     def _ensure_inplace_allowed(self) -> None:
+        reject_during_capture('In-place Tensor updates')
         if self.requires_grad and is_grad_enabled():
             raise RuntimeError("In-place assignment is not allowed on a Tensor with requires_grad=True.")
         if not self._writable or not writable(self._data):
