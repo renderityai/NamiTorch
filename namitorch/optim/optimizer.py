@@ -3,7 +3,7 @@ from collections import defaultdict
 import numpy as np
 
 from ..autograd import no_grad
-from ..backends import ensure_same_device, is_array
+from ..backends import ensure_same_device, get_backend, is_array
 from ..dtype import from_numpy_dtype
 from ..nn.parameter import Parameter
 from ..tensor import Tensor
@@ -17,7 +17,8 @@ def _copy_value(value, path: str, parameter_shape: tuple[int, ...] | None = None
         if isinstance(value, Tensor):
             return Tensor(value, device=value.device)
         from_numpy_dtype(value.dtype)
-        return value.copy()
+        with get_backend(value).context(value):
+            return value.copy()
     if isinstance(value, np.generic):
         from_numpy_dtype(value.dtype)
         return value.item()

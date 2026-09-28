@@ -5,9 +5,9 @@ from contextvars import ContextVar
 from types import MappingProxyType
 from typing import Any as Array, Callable
 
-from .backends import array_device, ensure_same_device, get_backend, is_array, namespace, transfer
+from .backends import array_device, ensure_same_device, get_backend, is_array, namespace, transfer, try_fused, try_fused_softmax
 
-from ._backend import elementwise_derivative, normalized_exponential_forward
+from ._backend import elementwise_derivative, elementwise_forward, normalized_exponential_forward
 from ._convolution import col2im, im2col
 from ._pooling import avg_pool2d_backward, max_pool2d_backward
 
@@ -147,8 +147,9 @@ class BackwardNode:
         if not self._device_transfer:
             ensure_same_device(gradient, *self.parents, *self.context.saved_arrays)
             _validate_metadata_device(self.context.metadata, array_device(gradient))
-        with get_backend(gradient).context():
-            contributions = self._backward(self.context, gradient)
+        backend = get_backend(gradient)
+        with backend.context(gradient, self.parents, self.context.saved_arrays, self.context.metadata):
+            contributions = backend.result(self._backward(self.context, gradient))
         if not isinstance(contributions, tuple) or len(contributions) != len(self.parents):
             raise RuntimeError(f"Backward rule for {self.name} must return one contribution per parent.")
         return contributions
@@ -536,8 +537,17 @@ def logsumexp_backward(context: Context, gradient: Array) -> tuple[Array]:
 
 def normalized_exponential_backward(context: Context, gradient: Array) -> tuple[Array]:
     xp = namespace(gradient)
-    output, = context.saved_arrays
+    output, *masks = context.saved_arrays
+    mask = masks[0] if masks else None
     axis = context.metadata["axis"]
+    causal = context.metadata.get("is_causal", False)
+    offset = context.metadata.get("query_position_offset", 0)
+    if context.metadata["operation"] == "softmax" and axis == output.ndim - 1:
+        operation = "causal_softmax_backward" if causal else "masked_softmax_backward" if mask is not None else "softmax_backward"
+        arrays = (output, gradient, mask) if causal or mask is not None else (output, gradient)
+        fused = try_fused_softmax(operation, *arrays, query_position_offset=offset)
+        if fused is not None:
+            return (fused,)
     with xp.errstate(under="ignore"):
         if context.metadata["operation"] == "softmax":
             dot = xp.sum(gradient * output, axis=axis, keepdims=True, dtype=gradient.dtype)
@@ -546,12 +556,19 @@ def normalized_exponential_backward(context: Context, gradient: Array) -> tuple[
             total = xp.sum(gradient, axis=axis, keepdims=True, dtype=gradient.dtype)
             contribution = gradient - xp.exp(output) * total
             xp.copyto(contribution, 0, where=xp.all(xp.isneginf(output), axis=axis, keepdims=True))
+    if mask is not None:
+        contribution = xp.where(mask, contribution, 0)
+    if causal:
+        allowed = xp.arange(output.shape[-1])[None, :] - min(offset, output.shape[-1]) <= xp.arange(output.shape[-2])[:, None]
+        contribution = xp.where(allowed, contribution, 0)
     return (xp.asarray(contribution),)
 
 
-def normalized_exponential_node(operation: str, parent, output, axis: int) -> BackwardNode:
-    context = Context(operation=operation, axis=axis)
+def normalized_exponential_node(operation: str, parent, output, axis: int, *, mask=None, is_causal=False, query_position_offset=0) -> BackwardNode:
+    context = Context(operation=operation, axis=axis, is_causal=is_causal, query_position_offset=query_position_offset)
     context.save_array(output._data, output._version_counter)
+    if mask is not None:
+        context.save_array(mask._data, mask._version_counter)
     return BackwardNode(operation, (parent,), normalized_exponential_backward, context)
 
 
@@ -647,6 +664,12 @@ _OUTPUT_DERIVATIVES = frozenset(("exp", "sqrt", "rsqrt", "tanh", "sigmoid"))
 def elementwise_backward(context: Context, gradient: Array) -> tuple[Array]:
     xp = namespace(gradient)
     value, = context.saved_arrays
+    operation = context.metadata["operation"]
+    operation = "gelu_tanh" if operation == "gelu" and context.metadata.get("approximation") == "tanh" else operation
+    if operation in ("sigmoid", "silu", "gelu_tanh"):
+        fused = try_fused(operation + "_backward", value, gradient)
+        if fused is not None:
+            return (fused,)
     derivative = elementwise_derivative(context.metadata["operation"], value, context.metadata)
     return (xp.asarray(gradient * derivative),)
 
@@ -656,6 +679,35 @@ def elementwise_node(operation: str, parent, output, parameters: tuple) -> Backw
     saved = output if operation in _OUTPUT_DERIVATIVES else parent
     context.save_array(saved._data, saved._version_counter)
     return BackwardNode(operation, (parent,), elementwise_backward, context)
+
+
+def fused_combine_backward(context: Context, gradient: Array) -> tuple[Array, ...]:
+    first, second = context.saved_arrays
+    operation = context.metadata["operation"]
+    local = try_fused(operation + "_backward", first, second, gradient)
+    if operation == "swiglu":
+        if local is None:
+            derivative = elementwise_derivative("silu", first, {})
+            activated = elementwise_forward("silu", first, context.metadata["dtype"])
+            local = (gradient * second * derivative, gradient * activated)
+        return tuple(local[index] for index in context.metadata["indices"])
+    if local is None:
+        value = first + second
+        activation = context.metadata["activation"]
+        if activation == "sigmoid":
+            value = elementwise_forward("sigmoid", value, context.metadata["dtype"])
+        local = gradient * elementwise_derivative(activation, value, context.metadata)
+    return tuple(sum_to_shape(local, shape) for shape in context.metadata["parent_shapes"])
+
+
+def fused_combine_node(operation: str, first, second, **metadata) -> BackwardNode:
+    operands = (first, second)
+    indices = tuple(index for index, value in enumerate(operands) if value.requires_grad)
+    parents = tuple(operands[index] for index in indices)
+    context = Context(operation=operation, indices=indices, dtype=first.dtype, parent_shapes=tuple(parent.shape for parent in parents), **metadata)
+    for operand in operands:
+        context.save_array(operand._data, operand._version_counter)
+    return BackwardNode(operation, parents, fused_combine_backward, context)
 
 
 def binary_extremum_backward(context: Context, gradient: Array) -> tuple[Array, ...]:
@@ -688,6 +740,10 @@ def clamp_backward(context: Context, gradient: Array) -> tuple[Array, ...]:
     value = operands[0]
     lower_index = 1 if context.metadata["has_min"] else None
     upper_index = 1 + int(context.metadata["has_min"]) if context.metadata["has_max"] else None
+    if context.metadata["parent_indices"] == (0,):
+        fused = try_fused("clamp_backward", value, operands.get(lower_index), operands.get(upper_index), gradient)
+        if fused is not None:
+            return (fused,)
     interior = xp.ones(value.shape, dtype=bool)
     invalid = xp.isnan(value)
     if lower_index is not None:

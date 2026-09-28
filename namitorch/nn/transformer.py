@@ -31,7 +31,7 @@ class SwiGLU(Module):
             raise ValueError(f"SwiGLU expects last dimension {self.d_model}, got {input.shape}.")
         if not input.dtype.is_floating_point:
             raise TypeError("SwiGLU requires floating input.")
-        hidden = F.silu(self.gate_proj(input)) * self.up_proj(input)
+        hidden = F.swiglu(self.gate_proj(input), self.up_proj(input))
         return self.dropout(self.down_proj(hidden))
 
     def __repr__(self) -> str:

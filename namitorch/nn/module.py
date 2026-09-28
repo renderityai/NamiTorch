@@ -224,7 +224,7 @@ class Module:
 
     def state_dict(self) -> OrderedDict[str, Tensor]:
         return OrderedDict(
-            (name, Tensor._from_array(value._data.copy(), False))
+            (name, Tensor(value, device=value.device))
             for name, value in self._state_members()
         )
 

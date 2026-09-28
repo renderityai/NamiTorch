@@ -23,10 +23,6 @@ class CUDARandom:
         self._lock = RLock()
         self._seed = randbits(64) if seed is None else seed
         self._counter = 0
-        with backend.context():
-            self._rng = backend.module.random.RandomState(
-                self._seed, method=backend.module.cuda.curand.CURAND_RNG_PSEUDO_PHILOX4_32_10,
-            )
 
     def manual_seed(self, seed):
         with self._lock:
@@ -70,25 +66,26 @@ class CUDARandom:
             if self._counter == 2 ** 64:
                 raise RuntimeError("CUDA generator substreams are exhausted; reseed the generator.")
             module = self.backend.module
-            self._rng.seed(_substream_seed(self._seed, self._counter))
-            try:
-                dimensions = (shape,) if isinstance(shape, int) else shape
-                if prod(dimensions) == 0:
-                    result = module.empty(dimensions, dtype=dtype)
-                elif operation == "permutation":
-                    result = self._rng.permutation(shape).astype(dtype, copy=False)
-                elif operation == "choice":
-                    if options["replace"]:
-                        result = self._rng.randint(0, options["n"], size=shape, dtype=dtype)
-                    else:
-                        result = self._rng.permutation(options["n"])[:prod(dimensions)].reshape(shape).astype(dtype, copy=False)
-                elif operation == "integers":
-                    result = self._rng.randint(options["low"], options["high"], size=shape, dtype=dtype)
-                elif operation == "random":
-                    result = self._rng.random_sample(shape, dtype=dtype)
+            rng = module.random.RandomState(
+                _substream_seed(self._seed, self._counter),
+                method=module.cuda.curand.CURAND_RNG_PSEUDO_PHILOX4_32_10,
+            )
+            self.backend.execution.hold(rng)
+            dimensions = (shape,) if isinstance(shape, int) else shape
+            if prod(dimensions) == 0:
+                result = module.empty(dimensions, dtype=dtype)
+            elif operation == "permutation":
+                result = rng.permutation(shape).astype(dtype, copy=False)
+            elif operation == "choice":
+                if options["replace"]:
+                    result = rng.randint(0, options["n"], size=shape, dtype=dtype)
                 else:
-                    result = self._rng.standard_normal(shape, dtype=dtype)
-            finally:
-                module.cuda.get_current_stream().synchronize()
+                    result = rng.permutation(options["n"])[:prod(dimensions)].reshape(shape).astype(dtype, copy=False)
+            elif operation == "integers":
+                result = rng.randint(options["low"], options["high"], size=shape, dtype=dtype)
+            elif operation == "random":
+                result = rng.random_sample(shape, dtype=dtype)
+            else:
+                result = rng.standard_normal(shape, dtype=dtype)
             self._counter += 1
             return result

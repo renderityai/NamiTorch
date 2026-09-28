@@ -121,7 +121,7 @@ from .random import Generator, categorical, choice, get_state, manual_seed, perm
 from .tensor import Tensor, as_tensor, tensor
 from .tokenization import ByteBPETokenizer
 from .serialization import SerializationError, load, save
-from .training import load_checkpoint, save_checkpoint
+from .training import load_checkpoint, memory_summary, save_checkpoint
 
 __version__ = "0.0.1"
 
@@ -134,6 +134,7 @@ __all__ = [
     "load",
     "save_checkpoint",
     "load_checkpoint",
+    "memory_summary",
     "nn",
     "optim",
     "data",

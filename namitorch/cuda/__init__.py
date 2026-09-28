@@ -1,5 +1,6 @@
-from .backends._cuda_runtime import runtime_call
-from .device import Device
+from ..backends._cuda_runtime import runtime_call
+from ..device import Device
+from ..backends._settings import enable_fused_kernels, fused_kernels_enabled
 
 
 def is_available():
@@ -50,14 +51,19 @@ def get_device_name(index=None):
 
 
 def manual_seed(seed):
-    from .random import _get_default_generator, _seed
+    from ..random import _get_default_generator, _seed
     value = _seed(seed)
     _get_default_generator(Device("cuda", current_device())).manual_seed(value)
 
 
 def manual_seed_all(seed):
-    from .random import _manual_seed_cuda_all
+    from ..random import _manual_seed_cuda_all
     _manual_seed_cuda_all(seed)
 
 
-__all__ = ["is_available", "device_count", "current_device", "set_device", "get_device_name", "get_device_properties", "manual_seed", "manual_seed_all"]
+from .streams import Event, Stream, current_stream, default_stream, elapsed_time, stream
+from . import memory
+from .memory import NamiTorchCUDAOutOfMemoryError, empty_cache, max_memory_allocated, max_memory_reserved, mem_get_info, memory_allocated, memory_reserved, reset_peak_memory_stats, synchronize
+
+
+__all__ = ["enable_fused_kernels", "fused_kernels_enabled", "Stream", "Event", "current_stream", "default_stream", "stream", "elapsed_time", "is_available", "device_count", "current_device", "set_device", "get_device_name", "get_device_properties", "manual_seed", "manual_seed_all", "memory", "memory_allocated", "memory_reserved", "max_memory_allocated", "max_memory_reserved", "empty_cache", "reset_peak_memory_stats", "mem_get_info", "synchronize", "NamiTorchCUDAOutOfMemoryError"]

@@ -4,11 +4,11 @@ from numbers import Real
 
 import numpy as np
 
-from ..backends import get_backend, namespace, readonly, same_device, writable
+from ..backends import get_backend, namespace, readonly, same_device, writable, try_fused, try_fused_softmax
 
 from .._convolution import conv2d_forward
 from .._pooling import avg_pool2d_forward, max_pool2d_forward
-from ..autograd import conv2d_node, embedding_node, is_grad_enabled, no_grad, pooling_node
+from ..autograd import conv2d_node, embedding_node, fused_combine_node, is_grad_enabled, no_grad, normalized_exponential_node, pooling_node
 from ..dtype import result_type
 from ..random import Generator, _get_rng, _validate_generator
 from ..tensor import Tensor
@@ -53,8 +53,11 @@ def linear(input: Tensor, weight: Tensor, bias: Tensor | None = None) -> Tensor:
             raise TypeError("linear bias must be a NamiTorch Tensor or None.")
         if bias.shape != (weight.shape[0],):
             raise ValueError(f"linear bias must have shape {(weight.shape[0],)}, got {bias.shape}.")
-    output = input @ weight.transpose(-2, -1)
-    return output if bias is None else output + bias
+    matrix = input.reshape(math.prod(input.shape[:-1]), input.shape[-1]) if input.ndim > 2 else input
+    output = matrix @ weight.transpose(-2, -1)
+    if bias is not None:
+        output = output + bias
+    return output.reshape(*input.shape[:-1], weight.shape[0]) if input.ndim > 2 else output
 
 
 def _spatial_tuple(value, dimensions, name, minimum):
@@ -206,6 +209,47 @@ def _require_input(input: Tensor) -> Tensor:
     if not isinstance(input, Tensor):
         raise TypeError("Functional operations require a NamiTorch Tensor input.")
     return input
+
+
+def _combined_output(array, operation, first, second, **metadata):
+    requires_grad = is_grad_enabled() and (first.requires_grad or second.requires_grad)
+    output = Tensor._from_array(array, requires_grad)
+    output._is_leaf = not requires_grad
+    if requires_grad:
+        output._grad_fn = fused_combine_node(operation, first, second, **metadata)
+    return output
+
+
+@same_device
+def swiglu(gate: Tensor, up: Tensor) -> Tensor:
+    _require_input(gate)
+    _require_input(up)
+    if not gate.dtype.is_floating_point or not up.dtype.is_floating_point:
+        raise TypeError("swiglu requires floating Tensors.")
+    array = try_fused("swiglu", gate._data, up._data)
+    if array is None:
+        return gate.silu() * up
+    return _combined_output(array, "swiglu", gate, up)
+
+
+@same_device
+def bias_activation(input: Tensor, bias: Tensor, activation: str = "gelu", *, approximation: str = "tanh") -> Tensor:
+    _require_input(input)
+    _require_input(bias)
+    if not input.dtype.is_floating_point or not bias.dtype.is_floating_point:
+        raise TypeError("bias_activation requires floating Tensors.")
+    if input.ndim < 1 or bias.shape != (input.shape[-1],):
+        raise ValueError("bias_activation requires a one-dimensional bias matching the last input dimension.")
+    if activation not in ("relu", "sigmoid", "silu", "gelu"):
+        raise ValueError("activation must be relu, sigmoid, silu or gelu.")
+    if approximation not in ("tanh", "exact"):
+        raise ValueError("approximation must be tanh or exact.")
+    operation = "bias_" + ("gelu_tanh" if activation == "gelu" else activation)
+    array = None if activation == "gelu" and approximation == "exact" else try_fused(operation, input._data, bias._data)
+    if array is None:
+        value = input + bias
+        return value.gelu(approximation) if activation == "gelu" else getattr(value, activation)()
+    return _combined_output(array, operation, input, bias, activation=activation, approximation=approximation)
 
 
 def _validate_inplace(inplace: bool) -> None:
@@ -360,16 +404,30 @@ def scaled_dot_product_attention(
         scores = (query @ key.transpose(-2, -1)) * factor
     if not xp.all(xp.isfinite(scores._data)):
         raise ValueError("Attention scores must be finite before masking; input magnitudes or scale exceed the compute dtype range.")
+    boolean_mask = mask if mask is not None and mask.dtype.is_boolean else None
+    if mask is not None and not mask.dtype.is_boolean:
+        with np.errstate(over="ignore", invalid="ignore", under="ignore"):
+            scores = scores + mask
+    operation = "causal_softmax" if is_causal else "masked_softmax" if boolean_mask is not None else "softmax"
+    arrays = (scores._data, None if boolean_mask is None else boolean_mask._data) if is_causal or boolean_mask is not None else (scores._data,)
+    fused = try_fused_softmax(operation, *arrays, query_position_offset=offset, require_nonempty=True)
+    if fused is not None:
+        weights = Tensor._from_array(fused, scores.requires_grad and is_grad_enabled())
+        weights._is_leaf = not weights.requires_grad
+        if weights.requires_grad:
+            weights._grad_fn = normalized_exponential_node(
+                "softmax", scores, weights, scores.ndim - 1, mask=boolean_mask,
+                is_causal=is_causal, query_position_offset=offset,
+            )
+        weights = dropout(weights, p=probability, training=training, generator=generator)
+        output = weights @ value
+        return (output, weights) if need_weights else output
     allowed = None
     if is_causal:
         key_positions = xp.arange(key_length) - min(offset, key_length)
         allowed = key_positions[None, :] <= xp.arange(query_length)[:, None]
-    if mask is not None:
-        if mask.dtype.is_boolean:
-            allowed = mask._data if allowed is None else xp.logical_and(allowed, mask._data)
-        else:
-            with np.errstate(over="ignore", invalid="ignore", under="ignore"):
-                scores = scores + mask
+    if boolean_mask is not None:
+        allowed = boolean_mask._data if allowed is None else xp.logical_and(allowed, boolean_mask._data)
     if allowed is not None:
         blocked = Tensor._from_array(xp.asarray(xp.logical_not(allowed)), False)
         scores = scores.masked_fill(blocked, -float("inf"))
@@ -765,6 +823,7 @@ def cross_entropy(
 
 
 __all__ = [
+    "swiglu", "bias_activation",
     "linear", "conv1d", "conv2d", "max_pool1d", "max_pool2d", "avg_pool1d", "avg_pool2d",
     "embedding", "relu", "leaky_relu", "elu", "gelu", "silu", "sigmoid",
     "tanh", "softplus", "softmax", "log_softmax", "dropout",

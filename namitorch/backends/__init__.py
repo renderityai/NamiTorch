@@ -6,6 +6,7 @@ import numpy as np
 
 from ..device import Device
 from .cpu import CPUBackend
+from ._settings import fused_kernels_enabled
 
 
 _backends = {Device("cpu"): CPUBackend()}
@@ -51,6 +52,22 @@ def get_array_module(value=None):
     return get_backend(value).module
 
 
+def try_fused(operation, *arrays):
+    if not fused_kernels_enabled():
+        return None
+    backend = get_backend(arrays[0])
+    fused = getattr(backend, "fused", None)
+    return None if fused is None else fused.run(operation, arrays)
+
+
+def try_fused_softmax(operation, *arrays, **parameters):
+    if not fused_kernels_enabled():
+        return None
+    backend = get_backend(arrays[0])
+    kernels = getattr(backend, "softmax", None)
+    return None if kernels is None else kernels.run(operation, arrays, **parameters)
+
+
 def namespace(value=None):
     return get_backend(value).namespace
 
@@ -80,8 +97,9 @@ def same_device(function):
     @wraps(function)
     def checked(*args, **kwargs):
         target = ensure_same_device(*args, *kwargs.values())
-        with get_backend(target).context():
-            return function(*args, **kwargs)
+        backend = get_backend(target)
+        with backend.context(args, kwargs):
+            return backend.result(function(*args, **kwargs))
     return checked
 
 

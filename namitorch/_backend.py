@@ -5,7 +5,7 @@ from typing import Any as Array
 
 import numpy as np
 
-from .backends import get_backend, namespace, readonly, same_device
+from .backends import get_backend, namespace, readonly, same_device, try_fused, try_fused_softmax
 
 from .dtype import DType
 from .utils import broadcast_shapes, matmul_shape
@@ -160,6 +160,11 @@ def elementwise_forward(
 ) -> Array:
     xp = namespace(value)
     data = value.astype(dtype.numpy_dtype, copy=False)
+    fused_operation = "gelu_tanh" if operation == "gelu" and approximation == "tanh" else operation
+    if fused_operation in ("sigmoid", "silu", "gelu_tanh"):
+        fused = try_fused(fused_operation, data)
+        if fused is not None:
+            return fused
     if operation in UNARY_UFUNCS:
         return unary_forward(operation, data, dtype)
     if operation == "sigmoid":
@@ -203,6 +208,10 @@ def elementwise_forward(
 def clamp_forward(
     value: Array, minimum: Array | None, maximum: Array | None, dtype: DType
 ) -> Array:
+    if value.dtype == dtype.numpy_dtype:
+        fused = try_fused("clamp", value, minimum, maximum)
+        if fused is not None:
+            return fused
     xp = namespace(value)
     output = xp.array(value, dtype=dtype.numpy_dtype, copy=True, order="C")
     if minimum is not None:
@@ -312,6 +321,10 @@ def where_forward(condition: Array, left: Array, right: Array, dtype: DType) -> 
 def normalized_exponential_forward(
     operation: str, value: Array, axes: tuple[int, ...], keepdim: bool = True,
 ) -> Array:
+    if operation == "softmax" and value.ndim > 0 and axes == (value.ndim - 1,):
+        fused = try_fused_softmax("softmax", value)
+        if fused is not None:
+            return fused
     xp = namespace(value)
     if operation == "logsumexp" and not axes:
         return value.copy()

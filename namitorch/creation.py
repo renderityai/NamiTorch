@@ -3,6 +3,8 @@ import math
 import numpy as np
 
 from .backends import namespace
+from .backends._pinned import pinned_empty
+from .device import Device
 
 from .dtype import DType, get_default_dtype, normalize_dtype, result_type
 from .tensor import Tensor, _validate_requires_grad
@@ -45,10 +47,16 @@ def ones(*shape: object, dtype: object = None, requires_grad: bool = False, devi
     return Tensor._from_array(xp.ones(dimensions, dtype=target.numpy_dtype), requires_grad)
 
 
-def empty(*shape: object, dtype: object = None, requires_grad: bool = False, device=None) -> Tensor:
-    xp = namespace(device)
+def empty(*shape: object, dtype: object = None, requires_grad: bool = False, device=None, pin_memory: bool = False) -> Tensor:
+    if type(pin_memory) is not bool:
+        raise TypeError("pin_memory must be a Python bool.")
     dimensions = normalize_shape(*shape)
     target = _factory_dtype(dtype, requires_grad)
+    if pin_memory:
+        if Device("cpu" if device is None else device).type != "cpu":
+            raise ValueError("Pinned memory is only available for CPU Tensors.")
+        return Tensor._from_array(pinned_empty(dimensions, target.numpy_dtype), requires_grad)
+    xp = namespace(device)
     return Tensor._from_array(xp.empty(dimensions, dtype=target.numpy_dtype), requires_grad)
 
 

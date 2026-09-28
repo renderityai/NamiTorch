@@ -1,8 +1,17 @@
+from contextlib import contextmanager
+from threading import RLock
+
 import numpy as np
 
-from ._cuda_random import CUDARandom
-from ._cuda_runtime import load_cupy, runtime_call
-from ._namespace import ArrayNamespace
+from .._cuda_execution import CUDAExecution, synchronize_array
+from .._cuda_memory import CUDAMemory
+from .._cuda_random import CUDARandom
+from .._cuda_runtime import load_cupy, runtime_call
+from .._namespace import ArrayNamespace
+from .._pinned import is_pinned
+from .kernels import CUDAKernels
+from .fused import FusedCUDAKernels
+from .softmax import SoftmaxCUDAKernels
 
 
 class CUDABackend:
@@ -15,31 +24,94 @@ class CUDABackend:
         self.module = module
         self.array_type = module.ndarray
         self.namespace = ArrayNamespace(self)
+        self.memory = CUDAMemory(module, device)
+        self.execution = CUDAExecution(module, device)
+        self.kernels = CUDAKernels(self)
+        self.fused = FusedCUDAKernels(self)
+        self.softmax = SoftmaxCUDAKernels(self)
+        self.memory.track_allocation = self.execution.allocated
+        self.memory.collect_completed = self.collect_transfers
+        self._pending_transfers = []
+        self._transfer_lock = RLock()
         self._erfc = module.ElementwiseKernel("T x", "T y", "y = erfc(x);", "namitorch_erfc")
 
-    def context(self):
-        return self.module.cuda.Device(self.device.index)
+    @contextmanager
+    def context(self, *operands):
+        with self.memory.context():
+            self.collect_transfers()
+            with self.execution.context(operands):
+                yield
+            self.collect_transfers()
+
+    def collect_transfers(self):
+        with self.module.cuda.Device(self.device.index), self._transfer_lock:
+            self.execution.collect()
+            self._pending_transfers = [entry for entry in self._pending_transfers if not entry[0].done]
+
+    def result(self, value):
+        return self.execution.result(value)
+
+    def ready_for_host(self, array):
+        self.execution.synchronize_array(array)
+        return array
+
+    def _retain_transfer(self, event, stream, source, destination):
+        try:
+            event.record(stream)
+            with self._transfer_lock:
+                self._pending_transfers.append((event, source, destination))
+        except Exception:
+            with self._transfer_lock:
+                self._pending_transfers.append((stream, source, destination))
+            stream.synchronize()
+            raise
 
     def array(self, value, dtype=None, copy=True, *, non_blocking=False):
         device_input = isinstance(value, self.array_type)
         cross_device = device_input and value.device.id != self.device.index
         if cross_device:
+            synchronize_array(value)
             with value.device:
                 self.module.cuda.get_current_stream().synchronize()
             if not self.module.cuda.runtime.deviceCanAccessPeer(self.device.index, value.device.id):
                 with value.device:
                     value = self.module.asnumpy(value, order="C", blocking=True)
                 device_input = False
-        with self.context():
+        with self.context(value):
+            stream = self.module.cuda.get_current_stream()
+            if np.isscalar(value):
+                scalar = np.asarray(value, dtype=dtype).item()
+                return self.module.full((), scalar, dtype=dtype)
+            pinned_source = (
+                not device_input and non_blocking and is_pinned(value)
+                and value.flags.c_contiguous and value.dtype.isnative
+                and (dtype is None or value.dtype == np.dtype(dtype))
+            )
+            if pinned_source:
+                result = self.module.empty(value.shape, dtype=value.dtype)
+                event = self.module.cuda.Event(disable_timing=True)
+                try:
+                    result.data.copy_from_host_async(value.ctypes.data, value.nbytes, stream)
+                except Exception:
+                    stream.synchronize()
+                    raise
+                self._retain_transfer(event, stream, value, result)
+                return result
             result = self.module.array(value, dtype=dtype, copy=copy, order="C")
-            if not non_blocking or not device_input or cross_device:
-                self.module.cuda.get_current_stream().synchronize()
+            if not device_input or cross_device:
+                stream.synchronize()
             if result.device.id != self.device.index:
                 raise RuntimeError(f"CUDA transfer produced storage on cuda:{result.device.id}, expected {self.device}.")
             return result
 
+    def item(self, array):
+        with self.context(array):
+            self.execution.synchronize_array(array)
+            return array.item()
+
     def to_numpy(self, array):
-        with self.context():
+        with self.context(array):
+            self.execution.synchronize_array(array)
             return self.module.asnumpy(array, order="C", blocking=True)
 
     def writable(self, array):
@@ -49,11 +121,11 @@ class CUDABackend:
         return array
 
     def erfc(self, array):
-        with self.context():
+        with self.context(array):
             return self._erfc(array)
 
     def add_at(self, array, index, values):
-        with self.context():
+        with self.context(array, index, values):
             if array.dtype.kind in "biu" and array.dtype.itemsize < 4:
                 working = array.astype(np.int32)
                 self.module.add.at(working, index, values)

@@ -14,13 +14,22 @@ class CPUBackend:
     namespace = np
     array_type = np.ndarray
 
-    def context(self):
+    def context(self, *operands):
         return nullcontext()
+
+    def result(self, value):
+        return value
+
+    def ready_for_host(self, array):
+        return array
 
     def array(self, value, dtype=None, copy=True, *, non_blocking=False):
         if copy:
             return np.array(value, dtype=dtype, copy=True, order="C", subok=False)
         return np.asarray(value, dtype=dtype, order="C")
+
+    def item(self, array):
+        return array.item()
 
     def to_numpy(self, array):
         return array.copy(order="C")

@@ -102,7 +102,7 @@ class CausalSelfAttention(Module):
                 dropout_p=self.attn_dropout, is_causal=True, query_position_offset=offset,
                 training=self.training, generator=self.generator,
             )
-            output = output.transpose(1, 2).contiguous().reshape(batch, length, self.d_model)
+            output = output.transpose(1, 2).reshape(batch, length, self.d_model)
             output = self.resid_dropout(self.o_proj(output))
         except Exception:
             if mutable_cache and use_cache:

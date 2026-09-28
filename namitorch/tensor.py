@@ -12,6 +12,7 @@ from typing import Any as Array
 import numpy as np
 
 from .backends import array_device, ensure_same_device, get_backend, is_array, namespace, readonly, same_device, transfer, writable
+from .backends._pinned import is_pinned, pinned_empty
 from .device import Device
 
 from ._backend import (
@@ -463,14 +464,29 @@ class Tensor:
     def item(self) -> builtins.bool | builtins.int | builtins.float:
         if self.size != 1:
             raise ValueError(f"item() requires exactly one element, got {self.size}.")
-        with self._backend.context():
-            return self._data.item()
+        return self._backend.item(self._data)
 
     def tolist(self) -> list | builtins.bool | builtins.int | builtins.float:
         return self.numpy().tolist()
 
     def numpy(self) -> np.ndarray:
         return self._backend.to_numpy(self._data)
+
+    def is_pinned(self) -> builtins.bool:
+        return is_pinned(self._data)
+
+    def pin_memory(self) -> Tensor:
+        if self.device.type != "cpu":
+            raise RuntimeError("pin_memory() requires a CPU Tensor; use .cpu() explicitly first.")
+        if self.is_pinned():
+            return self if is_grad_enabled() or not self.requires_grad else self.detach()
+        array = pinned_empty(self.shape, self.dtype.numpy_dtype)
+        np.copyto(array, self._data)
+        result = Tensor._from_array(array, self.requires_grad and is_grad_enabled())
+        if result.requires_grad:
+            result._is_leaf = False
+            result._grad_fn = BackwardNode("pin_memory", (self,), identity_backward, Context())
+        return result
 
     def clone(self) -> Tensor:
         result = Tensor(self, requires_grad=self.requires_grad and is_grad_enabled(), device=self.device)
@@ -733,8 +749,11 @@ class Tensor:
         bounds = tuple(bound for bound in (lower, upper) if bound is not None)
         if any(bound.ndim != 0 for bound in bounds):
             raise TypeError("clamp bounds must be scalars or zero-dimensional Tensors.")
-        if lower is not None and upper is not None and lower.item() > upper.item():
-            raise ValueError("clamp requires min <= max.")
+        if lower is not None and upper is not None:
+            lower_value = min.item() if isinstance(min, Tensor) else min
+            upper_value = max.item() if isinstance(max, Tensor) else max
+            if lower_value > upper_value:
+                raise ValueError("clamp requires min <= max.")
         dtype = self.dtype
         for bound in bounds:
             dtype = promote_types(dtype, bound.dtype)
@@ -1255,6 +1274,7 @@ class Tensor:
 
     @same_device
     def __repr__(self) -> str:
+        self._backend.ready_for_host(self._data)
         summarized = self.size > 1000
         display = self._data.reshape(-1) if summarized else self._data
         if summarized:

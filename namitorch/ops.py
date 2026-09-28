@@ -34,7 +34,7 @@ def stack(tensors, dim: object = 0) -> Tensor:
         raise ValueError(f"stack requires identical shapes, got {[operand.shape for operand in operands]}.")
     axis = normalize_axis(dim, len(shape) + 1)
     dtype = result_type(*(operand.dtype for operand in operands))
-    with get_backend(operands[0]).context():
+    with get_backend(operands[0]).context(operands):
         array = xp.stack([operand._data.astype(dtype.numpy_dtype, copy=False) for operand in operands], axis=axis)
     requires_grad = is_grad_enabled() and builtins.any(operand.requires_grad for operand in operands)
     output = Tensor._from_array(array, requires_grad)
@@ -64,7 +64,7 @@ def cat(tensors, dim: object = 0) -> Tensor:
     if builtins.any(operand.ndim != len(shape) or operand.shape[:axis] + operand.shape[axis + 1:] != shape[:axis] + shape[axis + 1:] for operand in operands):
         raise ValueError(f"cat requires matching ranks and dimensions except dim={axis}, got {[operand.shape for operand in operands]}.")
     dtype = result_type(*(operand.dtype for operand in operands))
-    with get_backend(operands[0]).context():
+    with get_backend(operands[0]).context(operands):
         array = xp.concatenate([operand._data.astype(dtype.numpy_dtype, copy=False) for operand in operands], axis=axis)
     requires_grad = is_grad_enabled() and builtins.any(operand.requires_grad for operand in operands)
     output = Tensor._from_array(array, requires_grad)

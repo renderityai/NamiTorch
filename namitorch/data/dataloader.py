@@ -1,5 +1,6 @@
 from ..random import Generator, _validate_generator
 from ._utils import boolean, integer, normalize_index
+from ._pin_memory import pin_batch
 from .collate import default_collate, default_convert
 from .dataset import IterableDataset, _map_dataset
 from .sampler import BatchSampler, RandomSampler, SequentialSampler
@@ -12,10 +13,11 @@ class DataLoader:
     def __init__(
         self, dataset, batch_size=_DEFAULT_BATCH_SIZE, shuffle: bool | None = None,
         sampler=None, batch_sampler=None, drop_last: bool = False, collate_fn=None,
-        *, generator: Generator | None = None,
+        *, generator: Generator | None = None, pin_memory: bool = False,
     ):
         shuffle = False if shuffle is None else boolean(shuffle, "shuffle")
         drop_last = boolean(drop_last, "drop_last")
+        self.pin_memory = boolean(pin_memory, "pin_memory")
         _validate_generator(generator, "cpu")
         if collate_fn is not None and not callable(collate_fn):
             raise TypeError("collate_fn must be callable or None.")
@@ -63,27 +65,31 @@ class DataLoader:
     def _sample(self, index):
         return self.dataset[normalize_index(index, len(self.dataset))]
 
+    def _collate(self, values):
+        batch = self.collate_fn(values)
+        return pin_batch(batch) if self.pin_memory else batch
+
     def __iter__(self):
         if self._iterable:
             if self.batch_size is None:
                 for sample in self.dataset:
-                    yield self.collate_fn(sample)
+                    yield self._collate(sample)
             else:
                 batch = []
                 for sample in self.dataset:
                     batch.append(sample)
                     if len(batch) == self.batch_size:
-                        yield self.collate_fn(batch)
+                        yield self._collate(batch)
                         batch = []
                 if batch and not self.drop_last:
-                    yield self.collate_fn(batch)
+                    yield self._collate(batch)
         elif self._custom_batch_sampler or self.batch_size is not None:
             batches = self.batch_sampler if self._custom_batch_sampler else BatchSampler(self.sampler, self.batch_size, self.drop_last)
             for indices in batches:
-                yield self.collate_fn([self._sample(index) for index in indices])
+                yield self._collate([self._sample(index) for index in indices])
         else:
             for index in self.sampler:
-                yield self.collate_fn(self._sample(index))
+                yield self._collate(self._sample(index))
 
     def __len__(self) -> int:
         if self._custom_batch_sampler:

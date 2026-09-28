@@ -30,7 +30,7 @@ class ArrayNamespace:
         def call(*args, **kwargs):
             self._validate(args)
             self._validate(tuple(kwargs.values()))
-            with self.backend.context():
+            with self.backend.context(args, kwargs):
                 if name == "array":
                     kwargs.pop("subok", None)
                 if name != "copyto" and "where" in kwargs:
@@ -59,7 +59,7 @@ class ArrayNamespace:
             def at(*args, **kwargs):
                 self._validate(args)
                 self._validate(tuple(kwargs.values()))
-                with self.backend.context():
+                with self.backend.context(args, kwargs):
                     if name == "add":
                         return self.backend.add_at(*args, **kwargs)
                     return attribute.at(*args, **kwargs)
