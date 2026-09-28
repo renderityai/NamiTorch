@@ -12,6 +12,7 @@ from .._pinned import is_pinned
 from .kernels import CUDAKernels
 from .fused import FusedCUDAKernels
 from .softmax import SoftmaxCUDAKernels
+from .normalization import NormalizationCUDAKernels
 
 
 class CUDABackend:
@@ -29,11 +30,20 @@ class CUDABackend:
         self.kernels = CUDAKernels(self)
         self.fused = FusedCUDAKernels(self)
         self.softmax = SoftmaxCUDAKernels(self)
+        self.normalization = NormalizationCUDAKernels(self)
+        self._float16_supported = None
         self.memory.track_allocation = self.execution.allocated
         self.memory.collect_completed = self.collect_transfers
         self._pending_transfers = []
         self._transfer_lock = RLock()
         self._erfc = module.ElementwiseKernel("T x", "T y", "y = erfc(x);", "namitorch_erfc")
+
+    def supports_float16(self):
+        if self._float16_supported is None:
+            properties = self.module.cuda.runtime.getDeviceProperties(self.device.index)
+            capability = (int(properties["major"]), int(properties["minor"]))
+            self._float16_supported = capability >= (5, 3) and self.module.dtype("float16") == np.dtype("float16") and callable(self.module.matmul)
+        return self._float16_supported
 
     @contextmanager
     def context(self, *operands):
@@ -67,6 +77,8 @@ class CUDABackend:
             raise
 
     def array(self, value, dtype=None, copy=True, *, non_blocking=False):
+        if dtype is not None and np.dtype(dtype) == np.dtype("float16") and not self.supports_float16():
+            raise RuntimeError(f"CUDA float16 is not supported on {self.device}.")
         device_input = isinstance(value, self.array_type)
         cross_device = device_input and value.device.id != self.device.index
         if cross_device:
@@ -126,7 +138,11 @@ class CUDABackend:
 
     def add_at(self, array, index, values):
         with self.context(array, index, values):
-            if array.dtype.kind in "biu" and array.dtype.itemsize < 4:
+            if array.dtype == np.dtype("float16"):
+                working = array.astype(np.float32)
+                self.module.add.at(working, index, self.module.asarray(values, dtype=np.float32))
+                self.module.copyto(array, working.astype(np.float16))
+            elif array.dtype.kind in "biu" and array.dtype.itemsize < 4:
                 working = array.astype(np.int32)
                 self.module.add.at(working, index, values)
                 self.module.copyto(array, working.astype(array.dtype))

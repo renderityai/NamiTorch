@@ -80,6 +80,11 @@ class CPUBackend:
 
 
     def random(self, generator, operation, shape, dtype, **options):
+        if dtype is not None and np.dtype(dtype) == np.dtype("float16") and operation in ("random", "standard_normal"):
+            result = getattr(generator, operation)(shape, dtype=np.float32).astype(np.float16)
+            if operation == "random":
+                np.minimum(result, np.nextafter(np.float16(1), np.float16(0)), out=result)
+            return result
         if operation == "permutation":
             return generator.permutation(shape).astype(dtype, copy=False)
         if operation == "choice":

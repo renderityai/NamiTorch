@@ -14,6 +14,7 @@ class UnsupportedDTypeError(TypeError):
 
 
 class DType(Enum):
+    float16 = "float16"
     float32 = "float32"
     float64 = "float64"
     int8 = "int8"
@@ -47,7 +48,7 @@ class DType(Enum):
 
     @property
     def is_floating_point(self) -> builtins.bool:
-        return self in (DType.float32, DType.float64)
+        return self in (DType.float16, DType.float32, DType.float64)
 
     @property
     def is_integer(self) -> builtins.bool:
@@ -70,6 +71,7 @@ class DType(Enum):
         return self.is_floating_point
 
 
+float16 = DType.float16
 float32 = DType.float32
 float64 = DType.float64
 int8 = DType.int8
@@ -90,19 +92,20 @@ _NUMPY_SCALAR_TO_DTYPE = MappingProxyType(
     }
 )
 
-_PROMOTION_ORDER = (bool, uint8, int8, int16, int32, int64, float32, float64)
+_PROMOTION_ORDER = (bool, uint8, int8, int16, int32, int64, float16, float32, float64)
 _PROMOTION_INDEX = MappingProxyType(
     {dtype: index for index, dtype in enumerate(_PROMOTION_ORDER)}
 )
 _PROMOTION_TABLE = (
-    (bool, uint8, int8, int16, int32, int64, float32, float64),
-    (uint8, uint8, int16, int16, int32, int64, float32, float64),
-    (int8, int16, int8, int16, int32, int64, float32, float64),
-    (int16, int16, int16, int16, int32, int64, float32, float64),
-    (int32, int32, int32, int32, int32, int64, float32, float64),
-    (int64, int64, int64, int64, int64, int64, float32, float64),
-    (float32, float32, float32, float32, float32, float32, float32, float64),
-    (float64, float64, float64, float64, float64, float64, float64, float64),
+    (bool, uint8, int8, int16, int32, int64, float16, float32, float64),
+    (uint8, uint8, int16, int16, int32, int64, float16, float32, float64),
+    (int8, int16, int8, int16, int32, int64, float16, float32, float64),
+    (int16, int16, int16, int16, int32, int64, float16, float32, float64),
+    (int32, int32, int32, int32, int32, int64, float16, float32, float64),
+    (int64, int64, int64, int64, int64, int64, float16, float32, float64),
+    (float16, float16, float16, float16, float16, float16, float16, float32, float64),
+    (float32, float32, float32, float32, float32, float32, float32, float32, float64),
+    (float64, float64, float64, float64, float64, float64, float64, float64, float64),
 )
 
 
@@ -217,6 +220,7 @@ def result_type(*values_or_dtypes: object, operation: str = "arithmetic") -> DTy
 __all__ = [
     "DType",
     "UnsupportedDTypeError",
+    "float16",
     "float32",
     "float64",
     "int8",

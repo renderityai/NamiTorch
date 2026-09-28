@@ -6,6 +6,8 @@ import numpy as np
 from ..backends import namespace, same_device
 
 from ..autograd import no_grad
+from ..amp import autocast_dtype
+from ..dtype import float32, result_type
 from ..nn import Dropout, Embedding, LayerKVCache, Linear, Module, ModuleList, RMSNorm, TransformerBlock, init
 from ..nn import functional as F
 from ..random import Generator, _validate_generator
@@ -124,10 +126,14 @@ class GPT(Module):
             LayerKVCache(
                 batch_size, self.config.n_kv_heads, self.config.d_model // self.config.n_heads,
                 max_seq_len=self.config.context_length if preallocate else None,
-                dtype=self.token_embedding.weight.dtype, device=self.token_embedding.weight.device,
+                dtype=self._cache_dtype(block), device=self.token_embedding.weight.device,
             )
-            for _ in self.blocks
+            for block in self.blocks
         ]
+
+    def _cache_dtype(self, block):
+        projection = block.attention.k_proj
+        return autocast_dtype("linear", projection.weight, projection.bias) or result_type(self.token_embedding.weight.dtype, projection.weight.dtype, float32)
 
     def _validate_tokens(self, tokens, name, shape=None, allow_ignore=False):
         xp = namespace(tokens)
@@ -158,9 +164,9 @@ class GPT(Module):
                 if id(entry) in seen:
                     raise ValueError("Each layer must have a distinct LayerKVCache.")
                 seen.add(id(entry))
-                entry.validate(batch, self.config.n_kv_heads, self.config.d_model // self.config.n_heads, self.token_embedding.weight.dtype, length if use_cache else 0)
-            elif any(tensor.dtype != self.token_embedding.weight.dtype for tensor in entry):
-                raise TypeError("Cache dtype must match the model dtype.")
+                entry.validate(batch, self.config.n_kv_heads, self.config.d_model // self.config.n_heads, self._cache_dtype(block), length if use_cache else 0)
+            elif any(tensor.dtype != self._cache_dtype(block) for tensor in entry):
+                raise TypeError("Cache dtype must match the attention projection compute dtype.")
         if len(set(lengths)) != 1:
             raise ValueError("All layer caches must have the same length.")
         return layers, lengths[0]

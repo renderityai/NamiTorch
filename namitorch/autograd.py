@@ -5,7 +5,7 @@ from contextvars import ContextVar
 from types import MappingProxyType
 from typing import Any as Array, Callable
 
-from .backends import array_device, ensure_same_device, get_backend, is_array, namespace, transfer, try_fused, try_fused_softmax
+from .backends import array_device, ensure_same_device, get_backend, is_array, namespace, transfer, try_fused, try_fused_normalization, try_fused_softmax
 
 from ._backend import elementwise_derivative, elementwise_forward, normalized_exponential_forward
 from ._convolution import col2im, im2col
@@ -178,7 +178,7 @@ def validate_gradient(parent, gradient, operation="gradient", *, exact_dtype=Fal
         raise RuntimeError(f"{operation} must be a registered backend gradient array.")
     if gradient.shape != parent.shape:
         raise RuntimeError(f"{operation} has invalid gradient shape {gradient.shape}; expected {parent.shape}.")
-    if not parent.dtype.can_require_grad or gradient.dtype.kind != "f" or gradient.dtype.itemsize not in (4, 8):
+    if not parent.dtype.can_require_grad or gradient.dtype.kind != "f" or gradient.dtype.itemsize not in (2, 4, 8):
         raise RuntimeError(f"{operation} requires supported floating gradients and a floating parent, got {gradient.dtype} and {parent.dtype}.")
     ensure_same_device(parent, gradient)
     if exact_dtype and gradient.dtype != parent.dtype.numpy_dtype:
@@ -570,6 +570,51 @@ def normalized_exponential_node(operation: str, parent, output, axis: int, *, ma
     if mask is not None:
         context.save_array(mask._data, mask._version_counter)
     return BackwardNode(operation, (parent,), normalized_exponential_backward, context)
+
+
+def normalization_backward(context: Context, gradient: Array) -> tuple[Array, ...]:
+    xp = namespace(gradient)
+    indices = context.metadata["indices"]
+    axes = tuple(range(gradient.ndim - 1))
+    if indices == (2,):
+        return (xp.asarray(xp.sum(gradient, axis=axes, dtype=gradient.dtype)),)
+    value, *weights = context.saved_arrays
+    weight = weights[0] if weights else None
+    statistics = context.metadata["statistics"]
+    needs = tuple(index in indices for index in range(3))
+    operation = context.metadata["operation"]
+    local = try_fused_normalization(operation + "_backward", value, weight, gradient, statistics, needs=needs)
+    if local is None:
+        shape = (*value.shape[:-1], 1)
+        inverse = statistics[:, 1].reshape(shape)
+        centered = value if operation == "rms_norm" else (value - value[..., :1]) - statistics[:, 0].reshape(shape)
+        normalized = centered * inverse
+        dx = dw = db = None
+        if needs[0]:
+            weighted = gradient if weight is None else gradient * weight
+            product_mean = xp.mean(weighted * normalized, axis=-1, keepdims=True, dtype=value.dtype)
+            local_gradient = weighted - normalized * product_mean
+            if operation == "layer_norm":
+                local_gradient = local_gradient - xp.mean(weighted, axis=-1, keepdims=True, dtype=value.dtype)
+            dx = inverse * local_gradient
+        if needs[1]:
+            dw = xp.sum(gradient * normalized, axis=axes, dtype=value.dtype)
+        if needs[2]:
+            db = xp.sum(gradient, axis=axes, dtype=value.dtype)
+        local = (dx, dw, db)
+    return tuple(xp.asarray(local[index]) for index in indices)
+
+
+def normalization_node(operation: str, input, weight, bias, statistics) -> BackwardNode:
+    operands = (input, weight, bias)
+    indices = tuple(index for index, value in enumerate(operands) if value is not None and value.requires_grad)
+    context = Context(operation=operation, indices=indices)
+    if 0 in indices or 1 in indices:
+        context.metadata["statistics"] = statistics
+        context.save_array(input._data, input._version_counter)
+        if 0 in indices and weight is not None:
+            context.save_array(weight._data, weight._version_counter)
+    return BackwardNode(operation, tuple(operands[index] for index in indices), normalization_backward, context)
 
 
 def mean_backward(context: Context, gradient: Array) -> tuple[Array]:

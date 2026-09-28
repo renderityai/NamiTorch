@@ -14,6 +14,7 @@ import numpy as np
 from .backends import array_device, ensure_same_device, get_backend, is_array, namespace, readonly, same_device, transfer, writable
 from .backends._pinned import is_pinned, pinned_empty
 from .device import Device
+from .amp import OPERATION_POLICIES, autocast_dtype
 
 from ._backend import (
     axis_index_coordinates,
@@ -52,6 +53,7 @@ from .dtype import (
     DType,
     UnsupportedDTypeError,
     bool as bool_dtype,
+    float16,
     float32,
     float64,
     from_numpy_dtype,
@@ -344,6 +346,8 @@ class Tensor:
         self._backend = get_backend(array)
         self._writable = writable(array)
         self._dtype = from_numpy_dtype(array.dtype)
+        if self._dtype is float16 and self._backend.device.type == "cuda" and not self._backend.supports_float16():
+            raise RuntimeError(f"CUDA float16 is not supported on {self._backend.device}.")
         _validate_requires_grad(self._dtype, requires_grad)
         self._data = array
         self._requires_grad = requires_grad
@@ -622,6 +626,9 @@ class Tensor:
         xp = namespace(self)
         operand = self._operand(other)
         left, right = (operand, self) if reverse else (self, operand)
+        cast_dtype = autocast_dtype(operation, left, right)
+        if cast_dtype is not None:
+            left, right = left.to(cast_dtype), right.to(cast_dtype)
         comparison = operation in ("equal", "not_equal", "less", "less_equal", "greater", "greater_equal")
         promotion = "true_divide" if operation == "true_divide" else "arithmetic"
         compute_dtype = promote_types(left.dtype, right.dtype, operation=promotion)
@@ -641,6 +648,8 @@ class Tensor:
     def _elementwise(
         self, operation: str, parameter: object = None, approximation: object = None
     ) -> Tensor:
+        if self.dtype is float16 and OPERATION_POLICIES.get(operation) == "float32":
+            return self.to(float32)._elementwise(operation, parameter, approximation)
         dtype = self.dtype
         if not dtype.is_floating_point and operation not in ("square", "absolute", "sign", "relu"):
             dtype = get_default_dtype()
@@ -888,6 +897,8 @@ class Tensor:
     def _reduce(
         self, operation: str, dim: object, keepdim: builtins.bool, correction: object = None
     ) -> Tensor:
+        if self.dtype is float16 and OPERATION_POLICIES.get(operation) == "float32":
+            return self.to(float32)._reduce(operation, dim, keepdim, correction)
         axes = normalize_reduction_axes(dim, self.ndim)
         if type(keepdim) is not builtins.bool:
             raise TypeError("keepdim must be a Python bool.")
@@ -927,6 +938,8 @@ class Tensor:
 
     @same_device
     def _normalized_exponential(self, operation: str, dim: object) -> Tensor:
+        if self.dtype is float16:
+            return self.to(float32)._normalized_exponential(operation, dim)
         axis = normalize_axis(dim, self.ndim)
         dtype = self.dtype if self.dtype.is_floating_point else get_default_dtype()
         array = normalized_exponential_forward(operation, self._data.astype(dtype.numpy_dtype, copy=False), (axis,))

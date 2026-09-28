@@ -1,6 +1,7 @@
 from numbers import Integral
 
 from ..autograd import no_grad
+from ..amp import GradScaler
 from ..nn.module import Module
 from ..optim.optimizer import Optimizer
 from ..optim.lr_scheduler import LRScheduler
@@ -76,7 +77,9 @@ def _unpack_optimizer(state):
     return restored
 
 
-def save_checkpoint(path, model, optimizer=None, scheduler=None, *, step=0, epoch=0, config=None, cumulative_tokens=0, generators=None) -> None:
+def save_checkpoint(path, model, optimizer=None, scheduler=None, *, step=0, epoch=0, config=None, cumulative_tokens=0, generators=None, scaler=None) -> None:
+    if scaler is not None and not isinstance(scaler, GradScaler):
+        raise TypeError("scaler must be a NamiTorch GradScaler or None.")
     generators = _components(model, optimizer, scheduler, generators)
     parameter_names = _optimizer_names(model, optimizer)
     if scheduler is not None and scheduler.get_lr() != [group["lr"] for group in optimizer.param_groups]:
@@ -98,6 +101,8 @@ def save_checkpoint(path, model, optimizer=None, scheduler=None, *, step=0, epoc
         "config": config,
         "cumulative_tokens": _counter(cumulative_tokens, "cumulative_tokens"),
     }
+    if scaler is not None:
+        checkpoint["scaler"] = scaler.state_dict()
     save(checkpoint, path)
 
 
@@ -123,17 +128,21 @@ def _prepare_rng(state, generators):
     return tuple(prepared.values()), cuda_update
 
 
-def load_checkpoint(path, model, optimizer=None, scheduler=None, *, generators=None, strict=True, restore_rng=True, max_array_bytes=None):
+def load_checkpoint(path, model, optimizer=None, scheduler=None, *, generators=None, strict=True, restore_rng=True, max_array_bytes=None, scaler=None):
+    if scaler is not None and not isinstance(scaler, GradScaler):
+        raise TypeError("scaler must be a NamiTorch GradScaler or None.")
     generators = _components(model, optimizer, scheduler, generators)
     if type(strict) is not bool or type(restore_rng) is not bool:
         raise TypeError("strict and restore_rng must be Python bools.")
     checkpoint = load(path, max_array_bytes=max_array_bytes)
-    if type(checkpoint) is not dict or set(checkpoint) != _CHECKPOINT_KEYS:
+    if type(checkpoint) is not dict or set(checkpoint) not in (_CHECKPOINT_KEYS, _CHECKPOINT_KEYS | {"scaler"}):
         raise SerializationError("Invalid checkpoint fields.")
     if type(checkpoint["checkpoint_version"]) is not int or checkpoint["checkpoint_version"] != 1:
         raise SerializationError("Unsupported checkpoint_version.")
     info = {name: _counter(checkpoint[name], name) for name in ("step", "epoch", "cumulative_tokens")}
     info["config"] = checkpoint["config"]
+    if scaler is not None:
+        scaler._prepare_load_state_dict(checkpoint.get("scaler"))
     result, model_updates = model._prepare_load_state_dict(checkpoint["model"], strict)
     optimizer_update = None
     if optimizer is not None:
@@ -155,6 +164,8 @@ def load_checkpoint(path, model, optimizer=None, scheduler=None, *, generators=N
         optimizer.defaults, optimizer.param_groups, optimizer.state = optimizer_update
     if scheduler_update is not None:
         scheduler._apply_loaded_state(scheduler_update)
+    if scaler is not None:
+        scaler.load_state_dict(checkpoint["scaler"])
     for generator, state in rng_updates:
         generator.set_state(state)
     if cuda_update is not None:

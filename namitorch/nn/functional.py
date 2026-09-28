@@ -4,12 +4,13 @@ from numbers import Real
 
 import numpy as np
 
-from ..backends import get_backend, namespace, readonly, same_device, writable, try_fused, try_fused_softmax
+from ..backends import get_backend, namespace, readonly, same_device, writable, try_fused, try_fused_normalization, try_fused_softmax
 
 from .._convolution import conv2d_forward
 from .._pooling import avg_pool2d_forward, max_pool2d_forward
-from ..autograd import conv2d_node, embedding_node, fused_combine_node, is_grad_enabled, no_grad, normalized_exponential_node, pooling_node
+from ..autograd import conv2d_node, embedding_node, fused_combine_node, is_grad_enabled, no_grad, normalization_node, normalized_exponential_node, pooling_node
 from ..dtype import result_type
+from ..amp import autocast, autocast_dtype, float32_function
 from ..random import Generator, _get_rng, _validate_generator
 from ..tensor import Tensor
 from ..utils import broadcast_shapes
@@ -53,8 +54,13 @@ def linear(input: Tensor, weight: Tensor, bias: Tensor | None = None) -> Tensor:
             raise TypeError("linear bias must be a NamiTorch Tensor or None.")
         if bias.shape != (weight.shape[0],):
             raise ValueError(f"linear bias must have shape {(weight.shape[0],)}, got {bias.shape}.")
+    cast_dtype = autocast_dtype("linear", input, weight, bias)
+    if cast_dtype is not None:
+        input, weight = input.to(cast_dtype), weight.to(cast_dtype)
+        bias = None if bias is None else bias.to(cast_dtype)
     matrix = input.reshape(math.prod(input.shape[:-1]), input.shape[-1]) if input.ndim > 2 else input
-    output = matrix @ weight.transpose(-2, -1)
+    with autocast(enabled=False):
+        output = matrix @ weight.transpose(-2, -1)
     if bias is not None:
         output = output + bias
     return output.reshape(*input.shape[:-1], weight.shape[0]) if input.ndim > 2 else output
@@ -473,19 +479,41 @@ def _normalization_arguments(input, normalized_shape, weight, bias, eps):
     if epsilon > float(np.finfo(input.dtype.numpy_dtype).max):
         raise ValueError(f"eps must be finite and positive in {input.dtype.name}.")
     with np.errstate(under="ignore"):
-        constant = Tensor(epsilon, dtype=input.dtype, device=input.device)
-    if constant.item() == 0:
+        constant = input.dtype.numpy_dtype.type(epsilon)
+    if constant == 0:
         raise ValueError(f"eps must remain positive in {input.dtype.name}.")
     axes = tuple(range(input.ndim - len(shape), input.ndim))
     return axes, constant
 
 
+def _fused_normalization(operation, input, weight, bias, axes, epsilon):
+    if len(axes) != 1:
+        return None
+    operands = (input, weight, bias)
+    requires_grad = is_grad_enabled() and any(value is not None and value.requires_grad for value in operands)
+    save_stats = is_grad_enabled() and (input.requires_grad or weight is not None and weight.requires_grad)
+    arrays = tuple(value._data if value is not None else None for value in operands)
+    fused = try_fused_normalization(operation, *arrays, eps=float(epsilon), save_stats=save_stats)
+    if fused is None:
+        return None
+    array, statistics = fused
+    output = Tensor._from_array(array, requires_grad=requires_grad)
+    output._is_leaf = not requires_grad
+    if requires_grad:
+        output._grad_fn = normalization_node(operation, input, weight, bias, statistics)
+    return output
+
+
 @same_device
+@float32_function
 def layer_norm(
     input: Tensor, normalized_shape: object, weight: Tensor | None = None,
     bias: Tensor | None = None, eps: float = 1e-5,
 ) -> Tensor:
     axes, epsilon = _normalization_arguments(input, normalized_shape, weight, bias, eps)
+    fused = _fused_normalization("layer_norm", input, weight, bias, axes, epsilon)
+    if fused is not None:
+        return fused
     mean = input.mean(dim=axes, keepdim=True)
     variance = input.var(dim=axes, keepdim=True, correction=0)
     output = (input - mean) * (variance + epsilon).rsqrt()
@@ -495,10 +523,14 @@ def layer_norm(
 
 
 @same_device
+@float32_function
 def rms_norm(
     input: Tensor, normalized_shape: object, weight: Tensor | None = None, eps: float = 1e-5,
 ) -> Tensor:
     axes, epsilon = _normalization_arguments(input, normalized_shape, weight, None, eps)
+    fused = _fused_normalization("rms_norm", input, weight, None, axes, epsilon)
+    if fused is not None:
+        return fused
     mean_square = input.square().mean(dim=axes, keepdim=True)
     output = input * (mean_square + epsilon).rsqrt()
     return output if weight is None else output * weight
@@ -512,6 +544,7 @@ def _batch_norm_momentum(momentum):
 
 
 @same_device
+@float32_function
 def batch_norm(input: Tensor, running_mean=None, running_var=None, weight=None, bias=None, training=False, momentum=0.1, eps=1e-5) -> Tensor:
     xp = namespace(input)
     _require_input(input)
@@ -644,18 +677,21 @@ def _loss_constant(value: float, name: str, input: Tensor) -> Tensor:
 
 
 @same_device
+@float32_function
 def mse_loss(input: Tensor, target: Tensor, reduction: str = "mean") -> Tensor:
     _loss_inputs(input, target, reduction)
     return _reduce_loss((input - target).square(), reduction)
 
 
 @same_device
+@float32_function
 def l1_loss(input: Tensor, target: Tensor, reduction: str = "mean") -> Tensor:
     _loss_inputs(input, target, reduction)
     return _reduce_loss((input - target).abs(), reduction)
 
 
 @same_device
+@float32_function
 def smooth_l1_loss(input: Tensor, target: Tensor, reduction: str = "mean", beta: float = 1.0) -> Tensor:
     _loss_inputs(input, target, reduction)
     beta = _loss_scale(beta, "beta", allow_zero=True)
@@ -669,6 +705,7 @@ def smooth_l1_loss(input: Tensor, target: Tensor, reduction: str = "mean", beta:
 
 
 @same_device
+@float32_function
 def huber_loss(input: Tensor, target: Tensor, reduction: str = "mean", delta: float = 1.0) -> Tensor:
     _loss_inputs(input, target, reduction)
     delta = _loss_scale(delta, "delta")
@@ -701,6 +738,7 @@ def _binary_loss_inputs(input: Tensor, target: Tensor, weight: Tensor | None, re
 
 
 @same_device
+@float32_function
 def binary_cross_entropy(input: Tensor, target: Tensor, weight: Tensor | None = None, reduction: str = "mean") -> Tensor:
     xp = namespace(input)
     _binary_loss_inputs(input, target, weight, reduction)
@@ -716,6 +754,7 @@ def binary_cross_entropy(input: Tensor, target: Tensor, weight: Tensor | None = 
 
 
 @same_device
+@float32_function
 def binary_cross_entropy_with_logits(
     input: Tensor, target: Tensor, weight: Tensor | None = None,
     reduction: str = "mean", pos_weight: Tensor | None = None,
@@ -806,6 +845,7 @@ def _classification_loss(
 
 
 @same_device
+@float32_function
 def nll_loss(
     input: Tensor, target: Tensor, weight: Tensor | None = None,
     ignore_index: int = -100, reduction: str = "mean",
@@ -814,6 +854,7 @@ def nll_loss(
 
 
 @same_device
+@float32_function
 def cross_entropy(
     input: Tensor, target: Tensor, weight: Tensor | None = None,
     ignore_index: int = -100, reduction: str = "mean", label_smoothing: float = 0.0,

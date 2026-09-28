@@ -68,6 +68,14 @@ def try_fused_softmax(operation, *arrays, **parameters):
     return None if kernels is None else kernels.run(operation, arrays, **parameters)
 
 
+def try_fused_normalization(operation, *arrays, **parameters):
+    if not fused_kernels_enabled():
+        return None
+    backend = get_backend(arrays[0])
+    kernels = getattr(backend, "normalization", None)
+    return None if kernels is None else kernels.run(operation, arrays, **parameters)
+
+
 def namespace(value=None):
     return get_backend(value).namespace
 

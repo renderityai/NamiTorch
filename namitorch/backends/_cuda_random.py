@@ -62,6 +62,8 @@ class CUDARandom:
         if operation not in ("permutation", "choice", "integers", "random", "standard_normal"):
             raise ValueError(f"Unsupported CUDA random operation {operation!r}.")
         dtype = np.float64 if dtype is None else dtype
+        half = np.dtype(dtype) == np.dtype("float16")
+        compute_dtype = np.float32 if half else dtype
         with self._lock, self.backend.context():
             if self._counter == 2 ** 64:
                 raise RuntimeError("CUDA generator substreams are exhausted; reseed the generator.")
@@ -84,8 +86,12 @@ class CUDARandom:
             elif operation == "integers":
                 result = rng.randint(options["low"], options["high"], size=shape, dtype=dtype)
             elif operation == "random":
-                result = rng.random_sample(shape, dtype=dtype)
+                result = rng.random_sample(shape, dtype=compute_dtype)
             else:
-                result = rng.standard_normal(shape, dtype=dtype)
+                result = rng.standard_normal(shape, dtype=compute_dtype)
+            if half:
+                result = result.astype(dtype, copy=False)
+                if operation == "random":
+                    module.minimum(result, np.nextafter(np.float16(1), np.float16(0)), out=result)
             self._counter += 1
             return result

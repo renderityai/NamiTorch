@@ -1,3 +1,4 @@
+from .amp import autocast
 from .device import Device, device
 from . import cuda
 from .backends import get_array_module
@@ -25,6 +26,7 @@ from .dtype import (
     UnsupportedDTypeError,
     bool,
     can_require_grad,
+    float16,
     float32,
     float64,
     from_numpy_dtype,
@@ -249,6 +251,8 @@ __all__ = [
     "randint",
     "DType",
     "UnsupportedDTypeError",
+    "autocast",
+    "float16",
     "float32",
     "float64",
     "int8",
