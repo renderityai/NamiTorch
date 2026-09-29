@@ -2,6 +2,7 @@ from contextlib import contextmanager
 from threading import RLock
 
 from ._graph_capture import current_capture
+from ._stream_scope import validate_stream_device
 
 
 class NamiTorchCUDAOutOfMemoryError(MemoryError):
@@ -49,6 +50,7 @@ class CUDAMemory:
         return NamiTorchCUDAOutOfMemoryError(self.device, requested, allocated, reserved, free, total)
 
     def allocate(self, size):
+        validate_stream_device(self.device)
         with self.module.cuda.Device(self.device.index), self._lock:
             try:
                 session = current_capture()
@@ -63,6 +65,7 @@ class CUDAMemory:
 
     @contextmanager
     def context(self):
+        validate_stream_device(self.device)
         with self.module.cuda.Device(self.device.index):
             try:
                 with self.module.cuda.using_allocator(self.allocate):

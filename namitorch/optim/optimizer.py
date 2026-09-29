@@ -3,7 +3,9 @@ from collections import defaultdict
 import numpy as np
 
 from ..autograd import no_grad
-from ..backends import ensure_same_device, get_backend, is_array
+from ..backends import ensure_same_device, get_backend, is_array, transfer
+from ..backends._graph_capture import reject_during_capture
+from ..device import Device
 from ..dtype import from_numpy_dtype
 from ..nn.parameter import Parameter
 from ..tensor import Tensor
@@ -41,6 +43,42 @@ def _copy_value(value, path: str, parameter_shape: tuple[int, ...] | None = None
             return copied
         copied = [_copy_value(item, f"{path}[{index}]", parameter_shape, active) for index, item in enumerate(value)]
         return tuple(copied) if isinstance(value, tuple) else copied
+    finally:
+        active.remove(identity)
+
+
+
+def _move_state(value, device, shape, path, memo, active):
+    identity = id(value)
+    if isinstance(value, Tensor) or is_array(value):
+        if value.shape not in ((), shape):
+            raise ValueError(f"{path} has incompatible optimizer state shape {value.shape}; expected {shape}.")
+        if identity not in memo:
+            if isinstance(value, Tensor):
+                if value.requires_grad or value.grad_fn is not None:
+                    raise RuntimeError(f"{path} must be detached from autograd before migration.")
+                memo[identity] = value.to(device)
+            else:
+                from_numpy_dtype(value.dtype)
+                memo[identity] = value if get_backend(value).device == device else transfer(value, device)
+        return memo[identity]
+    if isinstance(value, np.generic):
+        from_numpy_dtype(value.dtype)
+        return value.item()
+    if value is None or type(value) in (bool, int, float, str, bytes):
+        return value
+    if not isinstance(value, (dict, list, tuple)):
+        raise TypeError(f"{path} contains unsupported optimizer state type {type(value).__name__}.")
+    if identity in active:
+        raise ValueError(f"{path} contains a cyclic optimizer state container.")
+    active.add(identity)
+    try:
+        if isinstance(value, dict):
+            if any(type(key) not in (str, int) for key in value):
+                raise TypeError(f"{path} dictionary keys must be strings or integers.")
+            return {key: _move_state(item, device, shape, f"{path}[{key!r}]", memo, active) for key, item in value.items()}
+        result = [_move_state(item, device, shape, f"{path}[{index}]", memo, active) for index, item in enumerate(value)]
+        return tuple(result) if isinstance(value, tuple) else result
     finally:
         active.remove(identity)
 
@@ -246,6 +284,29 @@ class Optimizer:
             parameter = index_to_parameter[index]
             restored_state[id(parameter)] = self._prepare_state(values, parameter, f"state[{index}]")
         return defaults, restored_groups, restored_state
+
+    def to(self, device):
+        reject_during_capture("Moving optimizer state")
+        target = Device(device)
+        parameters = {id(parameter): parameter for parameter in self._registered_parameters()}
+        if any(parameter.device != target for parameter in parameters.values()):
+            raise RuntimeError(f"Move all optimizer parameters to {target} first with model.to(device); optimizer.to(device) moves only optimizer state.")
+        staged = defaultdict(dict)
+        memo = {}
+        with no_grad():
+            for identity, values in self.state.items():
+                if type(identity) is not int or identity not in parameters:
+                    raise ValueError("Optimizer state keys must identify registered Parameters.")
+                if not isinstance(values, dict):
+                    raise TypeError("Each parameter's optimizer state must be a dictionary.")
+                parameter = parameters[identity]
+                moved = _move_state(values, target, parameter.shape, "optimizer state", memo, set())
+                validate = getattr(self, "_check_state", None)
+                if validate is not None:
+                    validate(moved, parameter, "optimizer state", runtime=True)
+                staged[identity] = moved
+        self.state = staged
+        return self
 
     def load_state_dict(self, state_dict: dict) -> None:
         self.defaults, self.param_groups, self.state = self._prepare_load_state_dict(state_dict)

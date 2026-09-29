@@ -1,5 +1,6 @@
 from contextlib import contextmanager
 
+from ..backends._stream_scope import stream_device_scope
 from .memory import _backend
 
 
@@ -63,7 +64,7 @@ def default_stream(device=None):
 def stream(value):
     if not isinstance(value, Stream):
         raise TypeError("cuda.stream requires a NamiTorch CUDA Stream.")
-    with value._backend.module.cuda.Device(value.device.index), value._stream:
+    with stream_device_scope(value.device), value._backend.module.cuda.Device(value.device.index), value._stream:
         try:
             yield value
         finally:

@@ -5,6 +5,7 @@ from collections.abc import Mapping
 from typing import NamedTuple
 
 from ..backends import is_array, namespace, same_device, transfer, writable
+from ..backends._graph_capture import reject_during_capture
 from ..autograd import no_grad
 from ..tensor import Tensor
 from .parameter import Parameter
@@ -30,6 +31,7 @@ class LoadStateDictResult(NamedTuple):
 
 class Module:
     def to(self, device=None, dtype=None):
+        reject_during_capture("Moving a Module")
         values = list(self.parameters()) + list(self.buffers())
         staged = {}
         with no_grad():

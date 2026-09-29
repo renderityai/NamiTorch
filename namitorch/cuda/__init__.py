@@ -1,3 +1,4 @@
+from ..backends._cuda_peer import can_access_peer, enable_peer_access, disable_peer_access
 from ..backends._cuda_runtime import runtime_call
 from ..device import Device
 from ..backends._settings import enable_fused_kernels, fused_kernels_enabled
@@ -67,4 +68,4 @@ from .graphs import CUDAGraph
 from .memory import NamiTorchCUDAOutOfMemoryError, empty_cache, max_memory_allocated, max_memory_reserved, mem_get_info, memory_allocated, memory_reserved, reset_peak_memory_stats, synchronize
 
 
-__all__ = ["graphs", "CUDAGraph", "enable_fused_kernels", "fused_kernels_enabled", "Stream", "Event", "current_stream", "default_stream", "stream", "elapsed_time", "is_available", "device_count", "current_device", "set_device", "get_device_name", "get_device_properties", "manual_seed", "manual_seed_all", "memory", "memory_allocated", "memory_reserved", "max_memory_allocated", "max_memory_reserved", "empty_cache", "reset_peak_memory_stats", "mem_get_info", "synchronize", "NamiTorchCUDAOutOfMemoryError"]
+__all__ = ["can_access_peer", "enable_peer_access", "disable_peer_access", "graphs", "CUDAGraph", "enable_fused_kernels", "fused_kernels_enabled", "Stream", "Event", "current_stream", "default_stream", "stream", "elapsed_time", "is_available", "device_count", "current_device", "set_device", "get_device_name", "get_device_properties", "manual_seed", "manual_seed_all", "memory", "memory_allocated", "memory_reserved", "max_memory_allocated", "max_memory_reserved", "empty_cache", "reset_peak_memory_stats", "mem_get_info", "synchronize", "NamiTorchCUDAOutOfMemoryError"]

@@ -7,8 +7,11 @@ from .._cuda_execution import CUDAExecution, synchronize_array
 from .._cuda_memory import CUDAMemory
 from .._cuda_random import CUDARandom
 from .._cuda_runtime import load_cupy, runtime_call
+from .._cuda_peer import set_peer_access
+from ...device import Device
 from .._namespace import ArrayNamespace
 from .._graph_capture import current_capture, reject_during_capture
+from .._stream_scope import validate_stream_device
 from .._pinned import is_pinned
 from .kernels import CUDAKernels
 from .fused import FusedCUDAKernels
@@ -82,6 +85,7 @@ class CUDABackend:
             raise
 
     def array(self, value, dtype=None, copy=True, *, non_blocking=False):
+        validate_stream_device(self.device)
         if current_capture() is not None and (not isinstance(value, self.array_type) or value.device.id != self.device.index) and not np.isscalar(value):
             reject_during_capture("Host or cross-device transfers")
         if dtype is not None and np.dtype(dtype) == np.dtype("float16") and not self.supports_float16():
@@ -92,10 +96,24 @@ class CUDABackend:
             synchronize_array(value)
             with value.device:
                 self.module.cuda.get_current_stream().synchronize()
-            if not self.module.cuda.runtime.deviceCanAccessPeer(self.device.index, value.device.id):
-                with value.device:
-                    value = self.module.asnumpy(value, order="C", blocking=True)
-                device_input = False
+            peer = self.module.cuda.runtime.deviceCanAccessPeer(self.device.index, value.device.id)
+            peer_copy = getattr(self.module.cuda.runtime, "memcpyPeerAsync", None)
+            if peer and value.flags.c_contiguous and callable(peer_copy):
+                set_peer_access(self.module, self.device, Device("cuda", int(value.device.id)), True)
+                with self.context(value):
+                    stream = self.module.cuda.get_current_stream()
+                    result = self.module.empty(value.shape, dtype=value.dtype)
+                    try:
+                        if value.nbytes:
+                            peer_copy(result.data.ptr, self.device.index, value.data.ptr, value.device.id, value.nbytes, stream.ptr)
+                        if dtype is not None and result.dtype != np.dtype(dtype):
+                            result = result.astype(dtype, copy=False)
+                    finally:
+                        stream.synchronize()
+                    return self.result(result)
+            with value.device:
+                value = self.module.asnumpy(value, order="C", blocking=True)
+            device_input = False
         with self.context(value):
             stream = self.module.cuda.get_current_stream()
             if np.isscalar(value):
